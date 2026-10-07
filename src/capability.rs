@@ -54,6 +54,8 @@ pub struct Variable {
     pub transient: Vec<u32>,
     /// Persistent objects' handles, in order.
     pub persistent: Vec<u32>,
+    /// Defined NV indexes' handles, in order.
+    pub nv: Vec<u32>,
     /// Loaded sessions' handles, in order.
     pub loaded_sessions: Vec<u32>,
     /// Saved sessions' handles, in order.
@@ -128,7 +130,7 @@ fn variable(v: &Variable) -> Vec<(u32, u32)> {
     vec![
         (0x200, permanent),                                  // PERMANENT
         (0x201, startup_clear),                              // STARTUP_CLEAR
-        (0x202, 0),                                          // HR_NV_INDEX
+        (0x202, v.nv.len() as u32),                          // HR_NV_INDEX
         (0x203, loaded),                                     // HR_LOADED
         (0x204, MAX_LOADED_SESSIONS as u32 - loaded),        // HR_LOADED_AVAIL
         (0x205, active),                                     // HR_ACTIVE
@@ -197,7 +199,7 @@ pub fn get(
                 ht::HMAC_SESSION => from(&v.loaded_sessions),
                 ht::POLICY_SESSION => from(&v.saved_sessions),
                 ht::PERSISTENT => from(&v.persistent),
-                ht::NV_INDEX => Vec::new(),
+                ht::NV_INDEX => from(&v.nv),
                 _ => return Err(Rc::Fmt1(Fmt1::Value, Some(At::param(2)))),
             };
             emit(w, capability, count.min(MAX_CAP_HANDLES), handles.iter(), |w, h| w.u32(*h));

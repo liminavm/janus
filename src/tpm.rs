@@ -30,6 +30,7 @@ use crate::handle::{
 };
 use crate::hierarchy::{Hierarchy, NullSecrets, PersistentSecrets, Secrets};
 use crate::marshal::{List, Marshal, Tpm2b, Unmarshal};
+use crate::nv::{self, NvAuth, NvPublic, NvRef, NvStore};
 use crate::object::{self, Evicted, Loaded, Object, Objects, SensitiveKind, SequenceSlot};
 use crate::pcr::{self, Pcrs, Selection};
 use crate::rc::{At, Fmt0, Fmt1, Rc, Slot, Warn};
@@ -66,6 +67,8 @@ struct Persistent {
     clock_safe: bool,
     /// Objects made persistent by `TPM2_EvictControl`.
     evicted: Evicted,
+    /// NV indexes.
+    nv: NvStore,
     /// The last `TPM2_Shutdown`, until a Startup takes it or a command makes it stale.
     orderly: Option<Orderly>,
 }
@@ -184,6 +187,7 @@ impl<P: Platform> Janus<P> {
             clock: 0,
             clock_safe: true,
             evicted: Evicted::default(),
+            nv: NvStore::default(),
             orderly: None,
         };
         let now = platform.now_ms();
@@ -325,10 +329,12 @@ impl Tpm<Initialized> {
                 let mut reset = c.reset;
                 reset.clear_count = reset.clear_count.wrapping_add(1);
                 reset.restart_count = reset.restart_count.wrapping_add(1);
+                self.persistent.nv.startup(false);
                 (Pcrs::restart(&saved, locality), AuthValue::empty(), reset)
             }
             (StartupType::Clear, _, _) => {
                 self.persistent.reset_count += 1;
+                self.persistent.nv.startup(true);
                 (Pcrs::reset(locality), AuthValue::empty(), ResetState::new(platform))
             }
         };
@@ -356,8 +362,27 @@ impl Entity for HierarchyAuth {}
 impl Entity for Hierarchy {}
 impl Entity for Loaded {}
 impl Entity for SequenceSlot {}
+impl Entity for NvRef {}
 
 /// A handle's name for the cpHash: an object's is its name, everything else's is its handle.
+/// `TPMI_RH_PROVISION`: the owner or the platform, else `TPM_RC_VALUE` on the first handle.
+fn provision_handle(h: u32) -> Result<HierarchyAuth, Rc> {
+    match h {
+        crate::handle::rh::OWNER => Ok(HierarchyAuth::Owner),
+        crate::handle::rh::PLATFORM => Ok(HierarchyAuth::Platform),
+        _ => Err(Rc::Fmt1(Fmt1::Value, Some(At::handle(1)))),
+    }
+}
+
+/// `TPMI_RH_NV_INDEX` as handle `n`: `TPM_RC_VALUE` for any other handle type.
+fn nv_index_handle(h: u32, n: u8) -> Result<u32, Rc> {
+    if handle_type(h) == ht::NV_INDEX {
+        Ok(h)
+    } else {
+        Err(Rc::Fmt1(Fmt1::Value, Some(At::handle(n))))
+    }
+}
+
 fn handle_name(h: u32) -> Name2b {
     Buf::from_array(h.to_be_bytes())
 }
@@ -564,12 +589,7 @@ impl Tpm<Running> {
             }
             Cc::EvictControl => {
                 let [a, h] = cmd.handles()?;
-                // TPMI_RH_PROVISION.
-                let provision = match a {
-                    crate::handle::rh::OWNER => HierarchyAuth::Owner,
-                    crate::handle::rh::PLATFORM => HierarchyAuth::Platform,
-                    _ => return Err(Rc::Fmt1(Fmt1::Value, Some(At::handle(1)))),
-                };
+                let provision = provision_handle(a)?;
                 let target = self.object_handle(h, false, 2)?.expect("not NULL");
                 let names = vec![handle_name(a), self.name_of_object(Some(target))];
                 let mut auth = self.read_auth(&mut cmd, names)?;
@@ -585,6 +605,118 @@ impl Tpm<Running> {
                 r.finish().map_err(Rc::bare)?;
                 self.evict_control(provision.entity(), target, persistent)?;
                 (None, Writer::new(), auth)
+            }
+            Cc::NvDefineSpace => {
+                let [a] = cmd.handles()?;
+                let provision = provision_handle(a)?;
+                let mut auth = self.read_auth(&mut cmd, vec![handle_name(a)])?;
+                let raw = cmd.params();
+                self.authorize_hierarchy(&mut auth, raw, provision)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let mut r = Reader::new(&params);
+                let value = r.tpm2b::<MAX_DIGEST>().at(At::param(1))?;
+                let public = Tpm2b::<NvPublic>::read(&mut r).at(At::param(2))?.0;
+                r.finish().map_err(Rc::bare)?;
+                let platform = provision == HierarchyAuth::Platform;
+                self.persistent.nv.define(platform, value.get(), public)?;
+                (None, Writer::new(), auth)
+            }
+            Cc::NvUndefineSpace => {
+                let [a, h] = cmd.handles()?;
+                let provision = provision_handle(a)?;
+                let index = nv_index_handle(h, 2)?;
+                let index = self.nv_find(index, 2)?;
+                let names = vec![handle_name(a), self.nv_name(index)];
+                let mut auth = self.read_auth(&mut cmd, names)?;
+                let raw = cmd.params();
+                self.authorize_hierarchy(&mut auth, raw, provision)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                Reader::new(&params).finish().map_err(Rc::bare)?;
+                self.persistent.nv.undefine(provision == HierarchyAuth::Platform, index)?;
+                (None, Writer::new(), auth)
+            }
+            Cc::NvWrite | Cc::NvExtend | Cc::NvRead => {
+                let [a, h] = cmd.handles()?;
+                // TPMI_RH_NV_AUTH, then TPMI_RH_NV_INDEX; then whether each is defined.
+                let by = match a {
+                    crate::handle::rh::OWNER => NvAuth::Owner,
+                    crate::handle::rh::PLATFORM => NvAuth::Platform,
+                    _ if a == h => NvAuth::Index,
+                    _ => NvAuth::OtherIndex,
+                };
+                let authorizer = match by {
+                    NvAuth::Owner | NvAuth::Platform => None,
+                    NvAuth::Index | NvAuth::OtherIndex => Some(nv_index_handle(a, 1)?),
+                };
+                let index = nv_index_handle(h, 2)?;
+                let authorizer = match authorizer {
+                    Some(i) => Some(self.nv_find(i, 1)?),
+                    None => None,
+                };
+                let index = self.nv_find(index, 2)?;
+                let names = vec![
+                    authorizer.map_or_else(|| handle_name(a), |i| self.nv_name(i)),
+                    self.nv_name(index),
+                ];
+                let mut auth = self.read_auth(&mut cmd, names)?;
+                let raw = cmd.params();
+                let write = cc != Cc::NvRead;
+                match authorizer {
+                    Some(i) => {
+                        self.authorize_nv(&mut auth, raw, i, write)?;
+                    }
+                    None => {
+                        let h = if by == NvAuth::Owner {
+                            HierarchyAuth::Owner
+                        } else {
+                            HierarchyAuth::Platform
+                        };
+                        self.authorize_hierarchy(&mut auth, raw, h)?;
+                    }
+                }
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let mut r = Reader::new(&params);
+                let mut out = Writer::new();
+                let orderly = match cc {
+                    Cc::NvRead => {
+                        let size = r.u16().at(At::param(1))?;
+                        let offset = r.u16().at(At::param(2))?;
+                        r.finish().map_err(Rc::bare)?;
+                        out.tpm2b(self.persistent.nv.read(by, index, size, offset)?);
+                        false
+                    }
+                    Cc::NvWrite => {
+                        let data = r.tpm2b::<{ nv::MAX_NV_BUFFER_SIZE }>().at(At::param(1))?;
+                        let offset = r.u16().at(At::param(2))?;
+                        r.finish().map_err(Rc::bare)?;
+                        self.persistent.nv.write(by, index, data.get(), offset)?
+                    }
+                    _ => {
+                        let data = r.tpm2b::<{ nv::MAX_NV_BUFFER_SIZE }>().at(At::param(1))?;
+                        r.finish().map_err(Rc::bare)?;
+                        self.persistent.nv.extend(by, index, data.get())?
+                    }
+                };
+                // A write to an index kept in RAM makes the last orderly shutdown's saved state
+                // stale (`g_clearOrderly`).
+                if orderly {
+                    self.persistent.orderly = None;
+                }
+                (None, out, auth)
+            }
+            Cc::NvReadPublic => {
+                let [h] = cmd.handles()?;
+                let index = nv_index_handle(h, 1)?;
+                let index = self.nv_find(index, 1)?;
+                let mut auth = self.read_auth(&mut cmd, Vec::new())?;
+                let raw = cmd.params();
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                Reader::new(&params).finish().map_err(Rc::bare)?;
+                let public = &self.persistent.nv.get(index).public;
+                let mut out = Writer::new();
+                Tpm2b(public.clone()).write(&mut out);
+                public.name().write(&mut out);
+                (None, out, auth)
             }
             Cc::HierarchyChangeAuth => {
                 let [h] = cmd.handles()?;
@@ -925,6 +1057,7 @@ impl Tpm<Running> {
             orderly: p.orderly.is_some(),
             transient: self.stage.objects.handles_from(0),
             persistent: self.persistent.evicted.handles_from(0),
+            nv: self.persistent.nv.handles_from(0),
             loaded_sessions: sessions.handles_from(0, false),
             saved_sessions: sessions.handles_from(0, true),
         }
@@ -977,6 +1110,50 @@ impl Tpm<Running> {
                 Ok(Some(l))
             }
         }
+    }
+
+    /// The defined index `h` names: `TPM_RC_HANDLE` on handle `n` when it names none.
+    fn nv_find(&self, h: u32, n: u8) -> Result<NvRef, Rc> {
+        self.persistent.nv.find(h).ok_or(Rc::Fmt1(Fmt1::Handle, Some(At::handle(n))))
+    }
+
+    fn nv_name(&self, i: NvRef) -> Name2b {
+        self.persistent.nv.get(i).public.name()
+    }
+
+    /// An index's own authorization for a read or a write: its authValue where
+    /// `TPMA_NV_AUTHREAD` or `AUTHWRITE` allows it, its policy where `POLICYREAD` or
+    /// `POLICYWRITE` does, and dictionary-attack protection unless `TPMA_NV_NO_DA`.
+    fn authorize_nv(
+        &mut self,
+        auth: &mut Authorization,
+        params: &[u8],
+        i: NvRef,
+        write: bool,
+    ) -> Result<Authorized<NvRef>, Rc> {
+        let index = self.persistent.nv.get(i);
+        let a = index.public.attributes;
+        let name = index.public.name();
+        let (value_available, policy_available) = if write {
+            (a.auth_write(), a.policy_write())
+        } else {
+            (a.auth_read(), a.policy_read())
+        };
+        let entity = EntityAuth {
+            name: name.as_slice(),
+            value: &index.auth,
+            policy: if policy_available { index.public.auth_policy.as_slice() } else { &[] },
+            da: if a.no_da() { Da::Exempt } else { Da::Protected },
+            value_available,
+        };
+        auth.authorize(
+            &self.stage.reset.sessions,
+            params,
+            i,
+            &entity,
+            &mut self.lockout,
+            self.stage.pcrs.counter(),
+        )
     }
 
     /// A hierarchy's authorization: its authValue, always available, and no policy.
@@ -1067,7 +1244,7 @@ impl Tpm<Running> {
             EntityHandle::Hierarchy(_) | EntityHandle::Null | EntityHandle::Pcr(_) => Ok(None),
             EntityHandle::Transient(h) => self.resolve_object(ObjectHandle::Transient(h), n),
             EntityHandle::Persistent(h) => self.resolve_object(ObjectHandle::Persistent(h), n),
-            // No NV index can be defined yet.
+            // Binding a session to an NV index is not implemented.
             EntityHandle::NvIndex(_) => Err(Rc::Fmt1(Fmt1::Handle, Some(At::handle(n)))),
         }
     }

@@ -5,8 +5,10 @@
 /// An implemented command. A `TPM_CC` outside this enum is `TPM_RC_COMMAND_CODE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Cc {
+    NvUndefineSpace,
     EvictControl,
     HierarchyChangeAuth,
+    NvDefineSpace,
     CreatePrimary,
     SequenceComplete,
     SelfTest,
@@ -14,6 +16,7 @@ pub enum Cc {
     Shutdown,
     Create,
     Load,
+    NvRead,
     RsaDecrypt,
     SequenceUpdate,
     Sign,
@@ -23,8 +26,11 @@ pub enum Cc {
     FlushContext,
     PolicyAuthValue,
     PolicyCommandCode,
+    NvExtend,
+    NvWrite,
     ReadPublic,
     StartAuthSession,
+    NvReadPublic,
     EccParameters,
     GetCapability,
     GetRandom,
@@ -41,14 +47,19 @@ pub enum Cc {
 }
 
 /// The implemented commands in `TPM_CC` order, which is the order `TPM_CAP_COMMANDS` lists them.
-pub const IMPLEMENTED: [Cc; 33] = [
+pub const IMPLEMENTED: [Cc; 39] = [
     Cc::EvictControl,
+    Cc::NvUndefineSpace,
     Cc::HierarchyChangeAuth,
+    Cc::NvDefineSpace,
     Cc::CreatePrimary,
+    Cc::NvExtend,
+    Cc::NvWrite,
     Cc::SequenceComplete,
     Cc::SelfTest,
     Cc::Startup,
     Cc::Shutdown,
+    Cc::NvRead,
     Cc::Create,
     Cc::Load,
     Cc::RsaDecrypt,
@@ -58,6 +69,7 @@ pub const IMPLEMENTED: [Cc; 33] = [
     Cc::ContextLoad,
     Cc::ContextSave,
     Cc::FlushContext,
+    Cc::NvReadPublic,
     Cc::PolicyAuthValue,
     Cc::PolicyCommandCode,
     Cc::ReadPublic,
@@ -113,16 +125,21 @@ const NONE: Attributes = Attributes {
 impl Cc {
     pub const fn code(self) -> u32 {
         match self {
+            Cc::NvUndefineSpace => 0x122,
             Cc::EvictControl => 0x120,
             Cc::HierarchyChangeAuth => 0x129,
+            Cc::NvDefineSpace => 0x12A,
             Cc::CreatePrimary => 0x131,
             Cc::SequenceComplete => 0x13E,
+            Cc::NvExtend => 0x136,
+            Cc::NvWrite => 0x137,
             Cc::SelfTest => 0x143,
             Cc::Startup => 0x144,
             Cc::Shutdown => 0x145,
             Cc::Create => 0x153,
             Cc::Load => 0x157,
             Cc::RsaDecrypt => 0x159,
+            Cc::NvRead => 0x14E,
             Cc::SequenceUpdate => 0x15C,
             Cc::Sign => 0x15D,
             Cc::Unseal => 0x15E,
@@ -136,6 +153,7 @@ impl Cc {
             Cc::EccParameters => 0x178,
             Cc::GetCapability => 0x17A,
             Cc::GetRandom => 0x17B,
+            Cc::NvReadPublic => 0x169,
             Cc::ReadClock => 0x181,
             Cc::Hash => 0x17D,
             Cc::PcrRead => 0x17E,
@@ -159,7 +177,17 @@ impl Cc {
             Cc::HierarchyChangeAuth => {
                 Attributes { nv: true, handles: 1, auth_handles: 1, decrypt: true, ..NONE }
             }
-            Cc::EvictControl => Attributes { nv: true, handles: 2, auth_handles: 1, ..NONE },
+            Cc::EvictControl | Cc::NvUndefineSpace => {
+                Attributes { nv: true, handles: 2, auth_handles: 1, ..NONE }
+            }
+            Cc::NvDefineSpace => {
+                Attributes { nv: true, handles: 1, auth_handles: 1, decrypt: true, ..NONE }
+            }
+            Cc::NvWrite | Cc::NvExtend => {
+                Attributes { nv: true, handles: 2, auth_handles: 1, decrypt: true, ..NONE }
+            }
+            Cc::NvRead => Attributes { handles: 2, auth_handles: 1, encrypt: true, ..NONE },
+            Cc::NvReadPublic => Attributes { handles: 1, encrypt: true, ..NONE },
             Cc::CreatePrimary => Attributes {
                 handles: 1,
                 auth_handles: 1,

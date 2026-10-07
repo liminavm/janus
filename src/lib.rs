@@ -22,6 +22,7 @@ mod context;
 mod crypto;
 mod handle;
 mod hierarchy;
+mod nv;
 mod object;
 mod pcr;
 pub mod rc;

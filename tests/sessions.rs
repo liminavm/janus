@@ -1190,3 +1190,212 @@ fn evict_control_refuses_in_the_reference_order() {
     }
     assert_eq!(rc(&tpm.execute(Locality::ZERO, &load)), 0);
 }
+
+/// A password session whose password is `pw`, as an authorization area.
+fn pw_auth(pw: &[u8]) -> Vec<u8> {
+    [&RS_PW.to_be_bytes()[..], &[0, 0, 0], &tpm2b(pw)].concat()
+}
+
+/// TPMS_NV_PUBLIC for a SHA-256 index.
+fn nv_public(index: u32, attributes: u32, policy: &[u8], size: u16) -> Vec<u8> {
+    [
+        &index.to_be_bytes()[..],
+        &[0, 0x0B],
+        &attributes.to_be_bytes(),
+        &tpm2b(policy),
+        &size.to_be_bytes(),
+    ]
+    .concat()
+}
+
+fn nv_define(tpm: &mut Janus<Recorder>, by: u32, auth: &[u8], public: &[u8]) -> u32 {
+    let params = [tpm2b(auth), tpm2b(public)].concat();
+    rc(&tpm.execute(Locality::ZERO, &command(0x8002, 0x12A, &[by], Some(&pw_area()), &params)))
+}
+
+fn nv_write(
+    tpm: &mut Janus<Recorder>,
+    by: u32,
+    index: u32,
+    pw: &[u8],
+    data: &[u8],
+    offset: u16,
+) -> u32 {
+    let params = [tpm2b(data), offset.to_be_bytes().to_vec()].concat();
+    let c = command(0x8002, 0x137, &[by, index], Some(&pw_auth(pw)), &params);
+    rc(&tpm.execute(Locality::ZERO, &c))
+}
+
+fn nv_extend(tpm: &mut Janus<Recorder>, by: u32, index: u32, pw: &[u8], data: &[u8]) -> u32 {
+    let c = command(0x8002, 0x136, &[by, index], Some(&pw_auth(pw)), &tpm2b(data));
+    rc(&tpm.execute(Locality::ZERO, &c))
+}
+
+/// TPM2_NV_Read; returns the code and the data.
+fn nv_read(
+    tpm: &mut Janus<Recorder>,
+    by: u32,
+    index: u32,
+    pw: &[u8],
+    size: u16,
+    offset: u16,
+) -> (u32, Vec<u8>) {
+    let params = [size.to_be_bytes(), offset.to_be_bytes()].concat();
+    let rsp = tpm.execute(
+        Locality::ZERO,
+        &command(0x8002, 0x14E, &[by, index], Some(&pw_auth(pw)), &params),
+    );
+    if rc(&rsp) != 0 {
+        return (rc(&rsp), Vec::new());
+    }
+    let n = u16_at(&rsp, 14) as usize;
+    (0, rsp[16..16 + n].to_vec())
+}
+
+/// TPM2_NV_ReadPublic; returns the public area and the name.
+fn nv_read_public(tpm: &mut Janus<Recorder>, index: u32) -> (u32, Vec<u8>, Vec<u8>) {
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x169, &[index], None, &[]));
+    if rc(&rsp) != 0 {
+        return (rc(&rsp), Vec::new(), Vec::new());
+    }
+    let n = u16_at(&rsp, 10) as usize;
+    let m = u16_at(&rsp, 12 + n) as usize;
+    (0, rsp[12..12 + n].to_vec(), rsp[14 + n..14 + n + m].to_vec())
+}
+
+fn power_cycle(tpm: &mut Janus<Recorder>, shutdown_state: bool, startup_state: bool) {
+    let shutdown = [0x80, 0x01, 0, 0, 0, 0x0C, 0, 0, 0x01, 0x45, 0, shutdown_state as u8];
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &shutdown)), 0, "Shutdown");
+    tpm.init();
+    let startup = [0x80, 0x01, 0, 0, 0, 0x0C, 0, 0, 0x01, 0x44, 0, startup_state as u8];
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup)), 0, "Startup");
+}
+
+/// systemd-pcrlock's indexes (`tests/corpus/01-tpm2-setup`): owner-defined, extended under
+/// their own empty authValue, ORDERLY and CLEAR_STCLEAR, so they read like a PCR that starts
+/// over at every Startup(CLEAR).
+#[test]
+fn a_pcrlock_index_extends_like_a_pcr_and_starts_over_at_startup_clear() {
+    let (mut tpm, _) = started();
+    // The guest's own commands, byte for byte.
+    let define = hex(
+        "80020000002d0000012a40000001000000094000000900000000000000000e01d10201000b0c06004600000020",
+    );
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &define)), 0, "NV_DefineSpace");
+    let extend = hex("8002000000410000013601d1020101d10201000000094000000900000000000020\
+         697863029fdeb0ec64251db7acf3df4a663c2f5fcb7a5a27078d3556cff235aa");
+    let index = 0x01D1_0201;
+    let (_, before, name_before) = nv_read_public(&mut tpm, index);
+    assert_eq!(before, nv_public(index, 0x0C06_0046, &[], 32));
+    assert_eq!(name_before, [&[0, 0x0B][..], &sha256(&[&before])].concat());
+    // Unwritten: TPM_RC_NV_UNINITIALIZED.
+    assert_eq!(nv_read(&mut tpm, index, index, b"", 32, 0).0, 0x14A);
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &extend)), 0, "NV_Extend");
+    let d1 = &extend[extend.len() - 32..];
+    let once = sha256(&[&[0u8; 32][..], d1]);
+    assert_eq!(nv_read(&mut tpm, index, index, b"", 32, 0), (0, once.clone()));
+    // Written now: TPMA_NV_WRITTEN is set, and the name follows the public area.
+    let (_, after, name_after) = nv_read_public(&mut tpm, index);
+    assert_eq!(after, nv_public(index, 0x2C06_0046, &[], 32));
+    assert_eq!(name_after, [&[0, 0x0B][..], &sha256(&[&after])].concat());
+    // The owner may read it too (OWNERREAD), but a read of more than it holds is NV_RANGE.
+    assert_eq!(nv_read(&mut tpm, RH_OWNER, index, b"", 16, 16), (0, once[16..].to_vec()));
+    assert_eq!(nv_read(&mut tpm, RH_OWNER, index, b"", 32, 1).0, 0x146);
+    assert_eq!(nv_extend(&mut tpm, index, index, b"", b"more"), 0);
+    let twice = sha256(&[&once, b"more"]);
+    assert_eq!(nv_read(&mut tpm, index, index, b"", 32, 0), (0, twice.clone()));
+    // An extend index takes no NV_Write (TPM_RC_ATTRIBUTES).
+    assert_eq!(nv_write(&mut tpm, index, index, b"", &[1; 32], 0), 0x082);
+
+    // A Resume keeps it; a Restart starts it over, and an extend starts from zeros again.
+    power_cycle(&mut tpm, true, true);
+    assert_eq!(nv_read(&mut tpm, index, index, b"", 32, 0), (0, twice));
+    power_cycle(&mut tpm, true, false);
+    assert_eq!(nv_read(&mut tpm, index, index, b"", 32, 0).0, 0x14A);
+    assert_eq!(nv_extend(&mut tpm, index, index, b"", d1), 0);
+    assert_eq!(nv_read(&mut tpm, index, index, b"", 32, 0), (0, once));
+
+    // The index is ORDERLY, kept in RAM and saved at Shutdown: extending it after a
+    // Shutdown(STATE) makes that saved state stale, and the Resume is refused (VALUE).
+    let shutdown = [0x80, 0x01, 0, 0, 0, 0x0C, 0, 0, 0x01, 0x45, 0, 1];
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &shutdown)), 0);
+    assert_eq!(nv_extend(&mut tpm, index, index, b"", d1), 0);
+    tpm.init();
+    let resume = [0x80, 0x01, 0, 0, 0, 0x0C, 0, 0, 0x01, 0x44, 0, 1];
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &resume)), 0x1C4);
+}
+
+#[test]
+fn an_ordinary_index_holds_what_was_written_under_its_own_password() {
+    let (mut tpm, _) = started();
+    let index = 0x0150_0000;
+    // OWNERWRITE | AUTHWRITE | OWNERREAD | AUTHREAD.
+    let public = nv_public(index, 0x0006_0006, &[], 64);
+    assert_eq!(nv_define(&mut tpm, RH_OWNER, b"secret", &public), 0);
+    assert_eq!(nv_write(&mut tpm, index, index, b"secret", b"hello", 5), 0);
+    let mut expected = vec![0u8; 64];
+    expected[5..10].copy_from_slice(b"hello");
+    assert_eq!(nv_read(&mut tpm, index, index, b"secret", 64, 0), (0, expected));
+    // A wrong password for the index, which counts toward lockout: AUTH_FAIL on the session.
+    assert_eq!(nv_read(&mut tpm, index, index, b"wrong", 64, 0).0, 0x98E);
+    // An offset past the end is VALUE on it; data past the end is NV_RANGE.
+    assert_eq!(nv_write(&mut tpm, index, index, b"secret", b"x", 65), 0x2C4);
+    assert_eq!(nv_write(&mut tpm, index, index, b"secret", b"xy", 63), 0x146);
+    assert_eq!(nv_read(&mut tpm, index, index, b"secret", 1025, 0).0, 0x1C4);
+    // Another index authorizes, then is refused: TPM_RC_NV_AUTHORIZATION.
+    let other = 0x0150_0001;
+    assert_eq!(nv_define(&mut tpm, RH_OWNER, b"", &nv_public(other, 0x0006_0006, &[], 8)), 0);
+    assert_eq!(nv_read(&mut tpm, other, index, b"", 8, 0).0, 0x149);
+    // An index whose own authValue may not read it (no AUTHREAD): AUTH_UNAVAILABLE.
+    let owner_read = 0x0150_0002;
+    assert_eq!(nv_define(&mut tpm, RH_OWNER, b"", &nv_public(owner_read, 0x0002_0004, &[], 8)), 0);
+    assert_eq!(nv_write(&mut tpm, owner_read, owner_read, b"", b"12345678", 0), 0);
+    assert_eq!(nv_read(&mut tpm, owner_read, owner_read, b"", 8, 0).0, 0x12F);
+    assert_eq!(nv_read(&mut tpm, RH_OWNER, owner_read, b"", 8, 0), (0, b"12345678".to_vec()));
+    // The owner may not read or write an index that gives it neither: NV_AUTHORIZATION.
+    let own = 0x0150_0003;
+    assert_eq!(nv_define(&mut tpm, RH_OWNER, b"", &nv_public(own, 0x0004_0004, &[], 8)), 0);
+    assert_eq!(nv_write(&mut tpm, RH_OWNER, own, b"", b"12345678", 0), 0x149);
+    assert_eq!(nv_write(&mut tpm, own, own, b"", b"12345678", 0), 0);
+    assert_eq!(nv_read(&mut tpm, RH_OWNER, own, b"", 8, 0).0, 0x149);
+    // The platform may not, without PPREAD.
+    assert_eq!(nv_read(&mut tpm, 0x4000_000C, index, b"", 8, 0).0, 0x149);
+    // Undefined by the owner; then it names nothing (HANDLE on the index's handle).
+    let undefine = command(0x8002, 0x122, &[RH_OWNER, index], Some(&pw_area()), &[]);
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &undefine)), 0);
+    assert_eq!(nv_read(&mut tpm, RH_OWNER, index, b"", 8, 0).0, 0x28B);
+    assert_eq!(nv_read_public(&mut tpm, index).0, 0x18B);
+}
+
+#[test]
+fn nv_define_space_refuses_in_the_reference_order() {
+    let (mut tpm, _) = started();
+    let ok = 0x0006_0006;
+    let extend = ok | 0x40;
+    let mut define = |by: u32, auth: &[u8], public: Vec<u8>| nv_define(&mut tpm, by, auth, &public);
+    // TPMI_RH_NV_INDEX in the public area: VALUE on it; a reserved TPMA_NV bit: RESERVED_BITS.
+    assert_eq!(define(RH_OWNER, b"", nv_public(0x8100_0000, ok, &[], 8)), 0x2C4);
+    assert_eq!(define(RH_OWNER, b"", nv_public(0x0150_0000, ok | 0x100, &[], 8)), 0x2E1);
+    // A policy that is not a digest: SIZE on the public area.
+    assert_eq!(define(RH_OWNER, b"", nv_public(0x0150_0000, ok, &[1; 20], 8)), 0x2D5);
+    // An authValue longer than the digest: SIZE on the authValue.
+    assert_eq!(define(RH_OWNER, &[1; 33], nv_public(0x0150_0000, ok, &[], 8)), 0x1D5);
+    // A counter, which janus does not implement: ATTRIBUTES on the public area.
+    assert_eq!(define(RH_OWNER, b"", nv_public(0x0150_0000, ok | 0x10, &[], 8)), 0x2C2);
+    // An extend index the size of no digest: SIZE.
+    assert_eq!(define(RH_OWNER, b"", nv_public(0x0150_0000, extend, &[], 20)), 0x2D5);
+    // Written already, unreadable, unwritable: ATTRIBUTES.
+    assert_eq!(define(RH_OWNER, b"", nv_public(0x0150_0000, ok | 1 << 29, &[], 8)), 0x2C2);
+    assert_eq!(define(RH_OWNER, b"", nv_public(0x0150_0000, 0x0000_0006, &[], 8)), 0x2C2);
+    assert_eq!(define(RH_OWNER, b"", nv_public(0x0150_0000, 0x0006_0000, &[], 8)), 0x2C2);
+    // The platform's index made by the owner: ATTRIBUTES on the authorization handle.
+    assert_eq!(define(RH_OWNER, b"", nv_public(0x0150_0000, ok | 1 << 30, &[], 8)), 0x182);
+    // Defined twice: TPM_RC_NV_DEFINED.
+    assert_eq!(define(RH_OWNER, b"", nv_public(0x0150_0000, ok, &[], 8)), 0);
+    assert_eq!(define(RH_OWNER, b"", nv_public(0x0150_0000, ok, &[], 8)), 0x14C);
+    // Sixty-four indexes at most: TPM_RC_NV_SPACE.
+    for i in 1..64 {
+        assert_eq!(define(RH_OWNER, b"", nv_public(0x0150_0000 + i, ok, &[], 8)), 0, "{i}");
+    }
+    assert_eq!(define(RH_OWNER, b"", nv_public(0x0150_0040, ok, &[], 8)), 0x14B);
+}

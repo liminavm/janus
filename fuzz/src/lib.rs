@@ -56,8 +56,9 @@ fn run(tpm: &mut Janus<Fixed>, cmd: &[u8]) -> Vec<u8> {
 }
 
 /// A started TPM holding what the context and session paths need to be reachable: a primary
-/// key at 0x80000000, an owner key made persistent at 0x81000001, an HMAC session at
-/// 0x02000000, and, saved and out of memory, another primary key and another session. Returns the TPM and the two saved `TPMS_CONTEXT`s, which
+/// key at 0x80000000, an owner key made persistent at 0x81000001, systemd-pcrlock's extend
+/// index at 0x01d10201, an HMAC session at 0x02000000, and, saved and out of memory, another
+/// primary key and another session. Returns the TPM and the two saved `TPMS_CONTEXT`s, which
 /// are the same on every run because [`Fixed`] is.
 pub fn prepared() -> (Janus<Fixed>, Vec<Vec<u8>>) {
     let mut tpm = Janus::manufacture(Fixed);
@@ -90,6 +91,12 @@ pub fn prepared() -> (Janus<Fixed>, Vec<Vec<u8>>) {
     evict.extend_from_slice(&0x8100_0001u32.to_be_bytes());
     run(&mut tpm, &command(0x8002, 0x120, &evict));
     run(&mut tpm, &flush(0x8000_0001));
+    // tests/corpus/01-tpm2-setup's NV_DefineSpace.
+    let mut define = 0x4000_0001u32.to_be_bytes().to_vec();
+    define.extend_from_slice(&[0, 0, 0, 9, 0x40, 0, 0, 9, 0, 0, 1, 0, 0]);
+    define.extend_from_slice(&[0, 0, 0, 0x0E, 0x01, 0xD1, 0x02, 0x01, 0, 0x0B]);
+    define.extend_from_slice(&[0x0C, 0x06, 0x00, 0x46, 0, 0, 0, 0x20]);
+    run(&mut tpm, &command(0x8002, 0x12A, &define));
     run(&mut tpm, &session);
     run(&mut tpm, &session);
     let saved_session = run(&mut tpm, &save(0x0200_0001))[10..].to_vec();

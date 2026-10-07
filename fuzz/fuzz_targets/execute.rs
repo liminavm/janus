@@ -5,7 +5,7 @@
 #![no_main]
 
 use janus::{Janus, Locality};
-use janus_fuzz::{check_response, Fixed, STARTUP};
+use janus_fuzz::{Fixed, STARTUP, check_response};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

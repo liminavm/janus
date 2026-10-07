@@ -8,8 +8,26 @@ use sha2::Digest as _;
 
 /// `TPM_ALG_ID` values the engine names.
 pub mod id {
+    pub const RSA: u16 = 0x0001;
+    pub const HMAC: u16 = 0x0005;
     pub const AES: u16 = 0x0006;
+    pub const KEYEDHASH: u16 = 0x0008;
     pub const SHA256: u16 = 0x000B;
+    pub const NULL: u16 = 0x0010;
+    pub const RSASSA: u16 = 0x0014;
+    pub const RSAES: u16 = 0x0015;
+    pub const RSAPSS: u16 = 0x0016;
+    pub const OAEP: u16 = 0x0017;
+    pub const ECDSA: u16 = 0x0018;
+    pub const ECDH: u16 = 0x0019;
+    pub const ECC: u16 = 0x0023;
+    pub const SYMCIPHER: u16 = 0x0025;
+    pub const CFB: u16 = 0x0043;
+}
+
+/// `TPM_ECC_CURVE` values.
+pub mod curve {
+    pub const NIST_P256: u16 = 0x0003;
 }
 
 /// A hash this TPM implements. It has one PCR bank, SHA-256, and SHA-256 is the only hash it
@@ -30,6 +48,13 @@ impl Hash {
     pub const fn id(self) -> u16 {
         match self {
             Hash::Sha256 => id::SHA256,
+        }
+    }
+
+    /// The digest size in bytes.
+    pub const fn size(self) -> usize {
+        match self {
+            Hash::Sha256 => 32,
         }
     }
 
@@ -64,11 +89,31 @@ impl Hash {
     }
 }
 
+impl crate::marshal::Marshal for Hash {
+    fn write(&self, w: &mut Writer) {
+        w.u16(self.id());
+    }
+}
+
+impl crate::marshal::Unmarshal for Hash {
+    fn read(r: &mut Reader<'_>) -> Result<Hash, Fmt1> {
+        Hash::read(r)
+    }
+}
+
 /// A digest, tagged with the hash that made it, so its length can never disagree with its
 /// algorithm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Digest {
     Sha256([u8; 32]),
+}
+
+impl zeroize::Zeroize for Digest {
+    fn zeroize(&mut self) {
+        match self {
+            Digest::Sha256(d) => d.zeroize(),
+        }
+    }
 }
 
 impl Digest {

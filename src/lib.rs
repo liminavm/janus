@@ -12,15 +12,22 @@
 
 #![forbid(unsafe_code)]
 
+#[macro_use]
+mod marshal;
 mod alg;
 mod capability;
 mod cc;
 mod command;
+mod context;
+mod crypto;
 mod handle;
+mod hierarchy;
+mod object;
 mod pcr;
 pub mod rc;
 mod session;
 mod tpm;
+mod types;
 mod wire;
 
 pub use tpm::Janus;
@@ -40,7 +47,7 @@ impl Locality {
         self.0
     }
 
-    /// The locality's bit in a PCR's locality mask.
+    /// The locality's bit in a PCR's locality mask, and as `TPMA_LOCALITY` reports it.
     const fn bit(self) -> u8 {
         1 << self.0
     }

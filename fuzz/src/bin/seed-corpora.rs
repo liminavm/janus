@@ -7,7 +7,9 @@
 //!     cargo run --manifest-path fuzz/Cargo.toml --bin seed-corpora     (from the crate root)
 //!
 //! `execute` gets every distinct command. `sequence` gets each capture as one record stream,
-//! with `_TPM_Init` and locality changes where the capture had them.
+//! with `_TPM_Init` and locality changes where the capture had them. `prepared` gets every
+//! distinct command as a one-record stream, and a ContextLoad of each context the prepared TPM
+//! saved, which the fuzzer could not otherwise forge.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -23,6 +25,8 @@ fn main() {
     let sequence = root.join("fuzz/corpus/sequence");
     fs::create_dir_all(&execute).unwrap();
     fs::create_dir_all(&sequence).unwrap();
+    let prepared = root.join("fuzz/corpus/prepared");
+    fs::create_dir_all(&prepared).unwrap();
     let mut commands = BTreeSet::new();
     let mut captures: Vec<_> = fs::read_dir(root.join("tests/corpus")).unwrap().flatten().collect();
     captures.sort_by_key(|e| e.path());
@@ -49,6 +53,15 @@ fn main() {
     }
     for (i, cmd) in commands.iter().enumerate() {
         fs::write(execute.join(format!("{i:05}")), cmd).unwrap();
+        let mut record = vec![0xFF];
+        record.extend_from_slice(&(cmd.len() as u16).to_be_bytes());
+        record.extend_from_slice(cmd);
+        fs::write(prepared.join(format!("{i:05}")), record).unwrap();
+    }
+    let (_, contexts) = janus_fuzz::prepared();
+    for (i, c) in contexts.iter().enumerate() {
+        fs::write(prepared.join(format!("context-{i}")), janus_fuzz::context_load_record(c))
+            .unwrap();
     }
     println!("{} commands, sequences from every capture", commands.len());
 }

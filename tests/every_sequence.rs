@@ -100,14 +100,18 @@ struct Model {
     /// Extends of PCR 0 and PCR 16 since their last reset.
     pcr0: usize,
     pcr16: usize,
-    /// PCR 0's extends when `TPM2_Shutdown(STATE)` saved it, until a Startup takes it.
+    /// PCR 0's extends when `TPM2_Shutdown(STATE)` saved it, until a Startup takes it or an
+    /// extend of a state-saved PCR makes it stale (`PCR_Extend.c`, `RETURN_IF_ORDERLY`).
     saved: Option<usize>,
+    /// The last Shutdown(STATE) was made stale; for the reached check only.
+    stale: bool,
 }
 
 #[derive(Default)]
 struct Reached {
     resumed: bool,
     resume_refused: bool,
+    stale_save_refused: bool,
     restarted_after_state: bool,
     read_restored: bool,
     refused_before_startup: bool,
@@ -133,6 +137,7 @@ fn lifecycle() {
     }
     assert!(reached.resumed, "never resumed after Shutdown(STATE)");
     assert!(reached.resume_refused, "never refused a Startup(STATE) with nothing saved");
+    assert!(reached.stale_save_refused, "never refused a resume of a save made stale");
     assert!(reached.restarted_after_state, "never ran Startup(CLEAR) after Shutdown(STATE)");
     assert!(reached.read_restored, "never read a restored PCR");
     assert!(reached.refused_before_startup, "never refused a command before Startup");
@@ -163,12 +168,14 @@ fn step(tpm: &mut Janus<Zero>, m: &mut Model, op: Op, reached: &mut Reached, tra
                         fail("Startup(STATE) with nothing saved was not TPM_RC_VALUE");
                     }
                     reached.resume_refused = true;
+                    reached.stale_save_refused |= m.stale;
+                    m.stale = false;
                 }
                 (true, Some(pcr0)) => {
                     if r != 0 {
                         fail("Startup(STATE) after Shutdown(STATE) failed");
                     }
-                    *m = Model { running: true, pcr0, pcr16: 0, saved: None };
+                    *m = Model { running: true, pcr0, pcr16: 0, saved: None, stale: false };
                     reached.resumed = true;
                 }
                 (false, saved) => {
@@ -176,7 +183,7 @@ fn step(tpm: &mut Janus<Zero>, m: &mut Model, op: Op, reached: &mut Reached, tra
                         fail("Startup(CLEAR) failed");
                     }
                     reached.restarted_after_state |= saved.is_some();
-                    *m = Model { running: true, pcr0: 0, pcr16: 0, saved: None };
+                    *m = Model { running: true, pcr0: 0, pcr16: 0, saved: None, stale: false };
                 }
             }
         }
@@ -193,6 +200,7 @@ fn step(tpm: &mut Janus<Zero>, m: &mut Model, op: Op, reached: &mut Reached, tra
                 fail("Shutdown failed");
             }
             m.saved = state.then_some(m.pcr0);
+            m.stale = false;
         }
         Op::Extend { pcr } => {
             let r = rc(&tpm.execute(loc, &extend(pcr)));
@@ -206,7 +214,10 @@ fn step(tpm: &mut Janus<Zero>, m: &mut Model, op: Op, reached: &mut Reached, tra
                 fail("PCR_Extend failed");
             }
             match pcr {
-                0 => m.pcr0 += 1,
+                0 => {
+                    m.pcr0 += 1;
+                    m.stale |= m.saved.take().is_some();
+                }
                 _ => m.pcr16 += 1,
             }
         }

@@ -55,6 +55,10 @@ impl<'a> Reader<'a> {
         Ok(u32::from_be_bytes(self.array()?))
     }
 
+    pub fn u64(&mut self) -> Result<u64, Fmt1> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+
     /// The next `n` bytes as a reader of their own, for an area whose size the wire states.
     pub fn split(&mut self, n: usize) -> Result<Reader<'a>, Fmt1> {
         Ok(Reader::new(self.bytes(n)?))
@@ -107,7 +111,18 @@ impl<const MAX: usize> Buf<MAX> {
         buf
     }
 
-    #[cfg(test)]
+    /// `None` when `b` is longer than `MAX`: for data the engine made, where the bound is
+    /// the engine's to keep.
+    pub fn from_slice(b: &[u8]) -> Option<Self> {
+        if b.len() > MAX {
+            return None;
+        }
+        let mut buf = Self::empty();
+        buf.data[..b.len()].copy_from_slice(b);
+        buf.len = b.len();
+        Some(buf)
+    }
+
     pub fn from_array<const N: usize>(a: [u8; N]) -> Self {
         const { assert!(N <= MAX) };
         let mut buf = Self::empty();
@@ -125,6 +140,26 @@ impl<const MAX: usize> Buf<MAX> {
         while self.len > 0 && self.data[self.len - 1] == 0 {
             self.len -= 1;
         }
+    }
+}
+
+/// Public data only: a buffer holding a secret is wrapped in a type with no `PartialEq`, which
+/// compares in constant time if at all.
+impl<const MAX: usize> PartialEq for Buf<MAX> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<const MAX: usize> Eq for Buf<MAX> {}
+
+/// Public data only: a buffer holding a secret is wrapped in a type with no `Debug`.
+impl<const MAX: usize> core::fmt::Debug for Buf<MAX> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for b in self.as_slice() {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -159,6 +194,10 @@ impl Writer {
     }
 
     pub fn u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+
+    pub fn u64(&mut self, v: u64) {
         self.buf.extend_from_slice(&v.to_be_bytes());
     }
 

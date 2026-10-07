@@ -29,7 +29,6 @@ impl PcrIndex {
         if handle_type(h) == 0 && (h as usize) < PCR_COUNT { Some(PcrIndex(h as u8)) } else { None }
     }
 
-    #[cfg(kani)]
     pub fn get(self) -> u8 {
         self.0
     }
@@ -127,6 +126,18 @@ impl Selection {
     }
 }
 
+impl crate::marshal::Marshal for Selection {
+    fn write(&self, w: &mut Writer) {
+        Selection::write(self, w);
+    }
+}
+
+impl crate::marshal::Unmarshal for Selection {
+    fn read(r: &mut Reader<'_>) -> Result<Selection, Fmt1> {
+        Selection::read(r)
+    }
+}
+
 /// A `TPML_PCR_SELECTION`: at most one selection per implemented hash.
 pub fn read_selection_list(r: &mut Reader<'_>) -> Result<Vec<Selection>, Fmt1> {
     let count = r.u32()?;
@@ -188,6 +199,35 @@ impl Pcrs {
             }
         }
         pcrs
+    }
+
+    /// The bank as `TPM2_Startup(CLEAR)` after `TPM2_Shutdown(STATE)` leaves it (a TPM
+    /// Restart): every PCR reset, but the counter carries on from the saved one.
+    pub fn restart(saved: &Pcrs, startup_locality: Locality) -> Pcrs {
+        let mut pcrs = Pcrs::reset(startup_locality);
+        pcrs.counter = saved.counter.wrapping_add(pcrs.counter);
+        pcrs
+    }
+
+    /// Whether `TPM2_Shutdown(STATE)` saves this PCR. Changing one after the Shutdown makes the
+    /// save stale.
+    pub fn is_state_saved(p: PcrIndex) -> bool {
+        p.attributes().state_saved
+    }
+
+    /// The digest of the selected PCRs' values in index order (`PCRComputeCurrentDigest`),
+    /// with the selection as the TPM applied it.
+    pub fn digest(&self, hash: Hash, selection: Vec<Selection>) -> (Vec<Selection>, Digest) {
+        let mut values = Vec::new();
+        for s in &selection {
+            for p in PcrIndex::all() {
+                if s.contains(p) {
+                    values.push(self.sha256[p.0 as usize]);
+                }
+            }
+        }
+        let parts: Vec<&[u8]> = values.iter().map(Digest::as_slice).collect();
+        (selection, hash.digest(&parts))
     }
 
     fn changed(&mut self, p: PcrIndex) {

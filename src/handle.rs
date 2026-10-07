@@ -75,6 +75,70 @@ impl PcrOrNull {
     }
 }
 
+/// An object, or `TPM_RH_NULL` where the interface allows it (`TPMI_DH_OBJECT+`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectHandle {
+    Transient(u32),
+    Persistent(u32),
+    Null,
+}
+
+impl ObjectHandle {
+    pub const fn from_handle(h: u32, allow_null: bool) -> Option<ObjectHandle> {
+        match handle_type(h) {
+            ht::TRANSIENT => Some(ObjectHandle::Transient(h)),
+            ht::PERSISTENT => Some(ObjectHandle::Persistent(h)),
+            _ if h == rh::NULL && allow_null => Some(ObjectHandle::Null),
+            _ => None,
+        }
+    }
+}
+
+/// Anything with an authorization value (`TPMI_DH_ENTITY+`), as `TPM2_StartAuthSession`'s
+/// bind handle takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntityHandle {
+    Hierarchy(HierarchyAuth),
+    Null,
+    Pcr(PcrIndex),
+    Transient(u32),
+    Persistent(u32),
+    NvIndex(u32),
+}
+
+impl EntityHandle {
+    pub fn from_handle(h: u32, allow_null: bool) -> Option<EntityHandle> {
+        if let Some(a) = HierarchyAuth::from_handle(h) {
+            return Some(EntityHandle::Hierarchy(a));
+        }
+        match handle_type(h) {
+            ht::TRANSIENT => Some(EntityHandle::Transient(h)),
+            ht::PERSISTENT => Some(EntityHandle::Persistent(h)),
+            ht::NV_INDEX => Some(EntityHandle::NvIndex(h)),
+            ht::PCR => PcrIndex::from_handle(h).map(EntityHandle::Pcr),
+            _ if h == rh::NULL && allow_null => Some(EntityHandle::Null),
+            _ => None,
+        }
+    }
+}
+
+/// What a context can be saved from or flushed (`TPMI_DH_CONTEXT`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextHandle {
+    Transient(u32),
+    Session(u32),
+}
+
+impl ContextHandle {
+    pub const fn from_handle(h: u32) -> Option<ContextHandle> {
+        match handle_type(h) {
+            ht::TRANSIENT => Some(ContextHandle::Transient(h)),
+            ht::HMAC_SESSION | ht::POLICY_SESSION => Some(ContextHandle::Session(h)),
+            _ => None,
+        }
+    }
+}
+
 /// A session handle in an authorization area (`TPMI_SH_AUTH_SESSION+`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthSessionHandle {
@@ -123,6 +187,32 @@ mod proofs {
             }
             None => {
                 assert!(h != rh::NULL && h >= crate::pcr::PCR_COUNT as u32);
+            }
+        }
+    }
+
+    /// TPMI_DH_CONTEXT accepts exactly transient objects and sessions.
+    #[kani::proof]
+    fn context_handles_are_objects_or_sessions() {
+        let h: u32 = kani::any();
+        let t = handle_type(h);
+        assert!(
+            ContextHandle::from_handle(h).is_some()
+                == (t == ht::TRANSIENT || t == ht::HMAC_SESSION || t == ht::POLICY_SESSION)
+        );
+    }
+
+    /// TPMI_DH_ENTITY never accepts a session handle or TPM_RS_PW, and accepts NULL only when
+    /// asked to.
+    #[kani::proof]
+    fn entity_handles_exclude_sessions() {
+        let h: u32 = kani::any();
+        let allow_null: bool = kani::any();
+        if let Some(e) = EntityHandle::from_handle(h, allow_null) {
+            assert!(handle_type(h) != ht::HMAC_SESSION && handle_type(h) != ht::POLICY_SESSION);
+            assert!(h != rh::PW);
+            if e == EntityHandle::Null {
+                assert!(allow_null && h == rh::NULL);
             }
         }
     }

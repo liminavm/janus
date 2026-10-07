@@ -7,9 +7,8 @@
 
 use crate::capability::MAX_COMMAND_SIZE;
 use crate::cc::Cc;
-use crate::rc::{Fmt0, Rc};
-use crate::session::AuthArea;
-use crate::wire::{Reader, Writer};
+use crate::rc::{At, Fmt0, Index, Rc};
+use crate::wire::{Blame as _, Reader, Writer};
 
 /// `TPM_ST_NO_SESSIONS` / `TPM_ST_SESSIONS`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,22 +60,29 @@ pub fn frame(bytes: &[u8]) -> Result<Command<'_>, Rc> {
 }
 
 impl<'a> Command<'a> {
-    /// The authorization area, which follows the handles, with its sessions bound to the
-    /// handles that need authorization. A `TPM_ST_NO_SESSIONS` command has none, which is
-    /// `TPM_RC_AUTH_MISSING` if it has such a handle.
-    pub fn auth_area(&mut self) -> Result<AuthArea<'a>, Rc> {
-        let attrs = self.cc.attributes();
-        let mut area = match self.tag {
-            Tag::NoSessions => AuthArea::none(),
-            Tag::Sessions => AuthArea::read(&mut self.body, !attrs.no_sessions)?,
-        };
-        area.bind(usize::from(attrs.auth_handles))?;
-        Ok(area)
+    /// The command's handle area: `n` raw handles, each a `TPM_RC_INSUFFICIENT` at its
+    /// position if missing. The caller classifies them.
+    pub fn handles<const N: usize>(&mut self) -> Result<[u32; N], Rc> {
+        let mut out = [0u32; N];
+        for (i, h) in out.iter_mut().enumerate() {
+            let at = At::Handle(Index::new(i as u8 + 1).expect("at most seven handles"));
+            *h = self.body.u32().at(at)?;
+        }
+        Ok(out)
     }
 
-    /// The parameters have been read: anything left over is `TPM_RC_SIZE`.
-    pub fn finish(self) -> Result<(), Rc> {
-        self.body.finish().map_err(Rc::bare)
+    /// The authorization area, for `TPM_ST_SESSIONS`; `None` for `TPM_ST_NO_SESSIONS`.
+    pub fn area(&mut self) -> Option<&mut Reader<'a>> {
+        match self.tag {
+            Tag::Sessions => Some(&mut self.body),
+            Tag::NoSessions => None,
+        }
+    }
+
+    /// The parameter bytes: everything after the authorization area.
+    pub fn params(&mut self) -> &'a [u8] {
+        let n = self.body.remaining();
+        self.body.bytes(n).expect("the remaining bytes are there")
     }
 }
 
@@ -89,24 +95,25 @@ pub fn error(rc: Rc) -> Vec<u8> {
     w.into_vec()
 }
 
-/// A successful response: the command's tag, then the parameters, with the parameter size and
-/// the authorization area when the command carried sessions.
-pub fn success(tag: Tag, params: Writer, auth: &AuthArea<'_>) -> Vec<u8> {
-    auth.finish();
+/// A successful response: the command's tag, the response handle if the command has one, then
+/// the parameters, with the parameter size and the authorization area when the command carried
+/// sessions.
+pub fn success(tag: Tag, handle: Option<u32>, params: &[u8], area: &[u8]) -> Vec<u8> {
     let mut w = Writer::new();
     w.u16(tag.wire());
     w.u32(0);
     w.u32(0);
-    let params = params.into_vec();
+    if let Some(h) = handle {
+        w.u32(h);
+    }
     if tag == Tag::Sessions {
         w.u32(u32::try_from(params.len()).expect("a response's parameters exceed 4 GiB"));
     }
-    w.bytes(&params);
+    w.bytes(params);
     if tag == Tag::Sessions {
-        auth.write_response(&mut w);
+        w.bytes(area);
     }
-    let size = w.len();
-    let size = u32::try_from(size).expect("a response exceeds 4 GiB");
+    let size = u32::try_from(w.len()).expect("a response exceeds 4 GiB");
     w.patch_u32(2, size);
     w.into_vec()
 }

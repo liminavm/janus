@@ -8,10 +8,16 @@
 //! swtpm's response, or a control event: `init` is `_TPM_Init` (a platform reset), `locality`
 //! sets the locality of the commands after it.
 //!
-//! A replay runs until the first command janus does not implement, and each test states how
-//! far it must get. Most responses must match byte for byte. The exceptions are where the two
-//! TPMs differ by design, each handled by name in [`compare`]: vendor properties, the command
-//! list, the PCR update counter, and the hash algorithms only swtpm implements.
+//! A replay runs until the first command janus does not implement, or the first one an HMAC or
+//! policy session authorizes: such a session is salted to swtpm's key, whose private part only
+//! swtpm has, so its HMACs cannot verify against janus. `tests/sessions.rs` takes over from
+//! there with a client of its own. Each test states how far the replay must get.
+//!
+//! Most responses must match byte for byte. The exceptions are where the two TPMs differ by
+//! design, each handled by name in [`compare`]: vendor properties, the command list, the PCR
+//! update counter, the hash algorithms only swtpm implements, and everything derived from a
+//! TPM's own secrets (a primary key, a saved context, a ticket), which is compared by shape.
+//! A command that hands back one of swtpm's saved contexts gets janus's instead ([`adapt`]).
 
 use janus::{Janus, Locality, Platform};
 use serde_json::Value;
@@ -71,6 +77,12 @@ fn load(name: &str) -> Vec<Event> {
 /// The commands janus implements, by the decoder's names.
 const IMPLEMENTED: &[&str] = &[
     "HierarchyChangeAuth",
+    "CreatePrimary",
+    "ContextLoad",
+    "ContextSave",
+    "FlushContext",
+    "ReadPublic",
+    "StartAuthSession",
     "SelfTest",
     "Startup",
     "Shutdown",
@@ -80,13 +92,46 @@ const IMPLEMENTED: &[&str] = &[
     "PCR_Extend",
 ];
 
-/// Replays `name` from a freshly manufactured TPM until the first unimplemented command,
-/// returning how many commands were compared and the name of the one it stopped at.
+/// Handles in each implemented command's handle area, to find its authorization area.
+fn handle_count(cc: &str) -> usize {
+    match cc {
+        "StartAuthSession" => 2,
+        "HierarchyChangeAuth" | "CreatePrimary" | "PCR_Extend" | "ReadPublic" | "ContextSave" => 1,
+        _ => 0,
+    }
+}
+
+/// Whether a session other than a password authorizes or encrypts this command.
+fn uses_a_session(cc: &str, cmd: &[u8]) -> bool {
+    if u16_at(cmd, 0) != 0x8002 {
+        return false;
+    }
+    let at = 10 + 4 * handle_count(cc);
+    let end = at + 4 + u32_at(cmd, at) as usize;
+    let mut i = at + 4;
+    while i < end {
+        if u32_at(cmd, i) != 0x4000_0009 {
+            return true;
+        }
+        let nonce = u16_at(cmd, i + 4) as usize;
+        let hmac = u16_at(cmd, i + 7 + nonce) as usize;
+        i += 9 + nonce + hmac;
+    }
+    false
+}
+
+/// The saved contexts the two TPMs gave for the same ContextSave: swtpm's, then janus's.
+type Contexts = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Replays `name` from a freshly manufactured TPM until the first unimplemented command or the
+/// first one a session authorizes, returning how many commands were compared and why it
+/// stopped.
 fn replay(name: &str) -> (usize, Option<String>) {
     let mut tpm = Janus::manufacture(Counter(0));
     let mut locality = Locality::ZERO;
     let mut compared = 0;
     let mut started = false;
+    let mut contexts: Contexts = Vec::new();
     for (i, e) in load(name).into_iter().enumerate() {
         match e {
             Event::Init => {
@@ -100,7 +145,13 @@ fn replay(name: &str) -> (usize, Option<String>) {
                 if !IMPLEMENTED.contains(&cc.as_str()) {
                     return (compared, Some(cc));
                 }
-                let ours = tpm.execute(locality, &adapt(&cc, &cmd));
+                if uses_a_session(&cc, &cmd) {
+                    return (compared, Some(format!("{cc} under a session")));
+                }
+                let ours = tpm.execute(locality, &adapt(&cc, &cmd, &contexts));
+                if cc == "ContextSave" && u32_at(&ours, 6) == 0 && u32_at(&rsp, 6) == 0 {
+                    contexts.push((rsp[10..].to_vec(), ours[10..].to_vec()));
+                }
                 if let Err(why) = compare(&cc, &cmd, &ours, &rsp) {
                     panic!(
                         "{name}:{} {cc}: {why}\n  command  {}\n  swtpm    {}\n  janus    {}",
@@ -119,10 +170,22 @@ fn replay(name: &str) -> (usize, Option<String>) {
 
 /// The command the guest would have sent janus, where it differs from what it sent swtpm.
 ///
+/// A ContextLoad of a context swtpm saved loads the one janus saved at the same point.
+///
 /// edk2 sizes the random platform authorization by the largest digest among the banks
 /// `TPM_CAP_PCRS` lists (`GetAuthSize`, `PeiDxeTpmPlatformHierarchyLib.c`): 64 for swtpm, which
 /// lists SHA-512, and 32 for janus. Its 64-byte value is cut to the 32 bytes it would have sent.
-fn adapt(cc: &str, cmd: &[u8]) -> Vec<u8> {
+fn adapt(cc: &str, cmd: &[u8], contexts: &Contexts) -> Vec<u8> {
+    if cc == "ContextLoad" {
+        let Some((_, ours)) = contexts.iter().rev().find(|(theirs, _)| *theirs == cmd[10..]) else {
+            return cmd.to_vec();
+        };
+        let mut out = cmd[..10].to_vec();
+        out.extend_from_slice(ours);
+        let len = out.len() as u32;
+        out[2..6].copy_from_slice(&len.to_be_bytes());
+        return out;
+    }
     if cc != "HierarchyChangeAuth" {
         return cmd.to_vec();
     }
@@ -157,7 +220,10 @@ fn a_platform_auth_longer_than_any_digest_is_refused() {
     assert_eq!(rc_of(&tpm.execute(Locality::ZERO, &startup)), 0);
     // TPM_RC_SIZE on parameter 1.
     assert_eq!(rc_of(&tpm.execute(Locality::ZERO, cmd)), 0x1d5);
-    assert_eq!(rc_of(&tpm.execute(Locality::ZERO, &adapt("HierarchyChangeAuth", cmd))), 0);
+    assert_eq!(
+        rc_of(&tpm.execute(Locality::ZERO, &adapt("HierarchyChangeAuth", cmd, &Vec::new()))),
+        0
+    );
 }
 
 fn rc_of(rsp: &[u8]) -> u32 {
@@ -188,6 +254,16 @@ fn compare(cc: &str, cmd: &[u8], ours: &[u8], theirs: &[u8]) -> Result<(), Strin
                 Err("PCR values or selection differ".into())
             }
         }
+        "CreatePrimary" => compare_create_primary(ours, theirs),
+        "ContextSave" => compare_context(ours, theirs),
+        // A session handle and a nonce as long as the caller's.
+        "StartAuthSession" => {
+            if ours.len() == theirs.len() && ours[..16] == theirs[..16] {
+                Ok(())
+            } else {
+                Err("a different session handle or nonce size".into())
+            }
+        }
         // Random bytes: the same shape.
         "GetRandom" => {
             if ours.len() == theirs.len() && ours[..12] == theirs[..12] {
@@ -198,6 +274,65 @@ fn compare(cc: &str, cmd: &[u8], ours: &[u8], theirs: &[u8]) -> Result<(), Strin
         }
         _ if ours == theirs => Ok(()),
         _ => Err("responses differ".into()),
+    }
+}
+
+/// Splits a TPM2B off the front of `b`.
+fn tpm2b(b: &[u8]) -> (&[u8], &[u8]) {
+    let n = u16_at(b, 0) as usize;
+    (&b[2..2 + n], &b[2 + n..])
+}
+
+/// CreatePrimary: the same handle, the same public area but for the key janus generated from
+/// its own seed, the same creation data and creation hash (which depend only on the command
+/// and the PCRs), a ticket for the same hierarchy, and a name of the same algorithm.
+fn compare_create_primary(ours: &[u8], theirs: &[u8]) -> Result<(), String> {
+    // header (10), handle (4), parameterSize (4)
+    if ours[10..14] != theirs[10..14] {
+        return Err("a different object handle".into());
+    }
+    let (o, t) = (&ours[18..], &theirs[18..]);
+    let (o_public, o) = tpm2b(o);
+    let (t_public, t) = tpm2b(t);
+    // An ECC public area ends with its point: two 32-byte coordinates, each a TPM2B.
+    let template = |p: &[u8]| p[..p.len() - 68].to_vec();
+    if o_public.len() != t_public.len() || template(o_public) != template(t_public) {
+        return Err("the public areas differ beyond the key".into());
+    }
+    let (o_creation, o) = tpm2b(o);
+    let (t_creation, t) = tpm2b(t);
+    if o_creation != t_creation {
+        return Err("the creation data differ".into());
+    }
+    let (o_hash, o) = tpm2b(o);
+    let (t_hash, t) = tpm2b(t);
+    if o_hash != t_hash {
+        return Err("the creation hashes differ".into());
+    }
+    // TPMT_TK_CREATION: tag, hierarchy, digest (swtpm's is SHA-512, janus's SHA-256).
+    if o[..6] != t[..6] {
+        return Err("the ticket's tag or hierarchy differ".into());
+    }
+    let (_, o) = tpm2b(&o[6..]);
+    let (_, t) = tpm2b(&t[6..]);
+    let (o_name, o) = tpm2b(o);
+    let (t_name, t) = tpm2b(t);
+    if o_name.len() != t_name.len() || o_name[..2] != t_name[..2] {
+        return Err("the names differ in shape".into());
+    }
+    if o != t {
+        return Err("the authorization areas differ".into());
+    }
+    Ok(())
+}
+
+/// ContextSave: the same sequence, saved handle and hierarchy; the blob is each TPM's own.
+fn compare_context(ours: &[u8], theirs: &[u8]) -> Result<(), String> {
+    // header (10), sequence (8), savedHandle (4), hierarchy (4), contextBlob
+    if ours[10..26] == theirs[10..26] {
+        Ok(())
+    } else {
+        Err("a different sequence, saved handle or hierarchy".into())
     }
 }
 
@@ -270,19 +405,21 @@ fn compare_capability(capability: u32, ours: &[u8], theirs: &[u8]) -> Result<(),
 }
 
 /// edk2 and the kernel's first commands: two boots (a firmware reset in between), every PCR
-/// measurement and the platform hierarchy's new authorization, up to the kernel's first
-/// CreatePrimary.
+/// measurement and the platform hierarchy's new authorization, then the kernel's null primary
+/// key, saved, flushed and loaded back, and the salted session it starts with that key, up to
+/// the first command that session protects.
 #[test]
-fn the_firmware_prefix_of_a_boot_replays() {
+fn a_boot_replays_up_to_the_kernels_first_session() {
     let (compared, stopped) = replay("boot");
-    assert_eq!(stopped.as_deref(), Some("CreatePrimary"));
-    assert_eq!(compared, 257, "the boot prefix grew or shrank");
+    assert_eq!(stopped.as_deref(), Some("GetRandom under a session"));
+    assert_eq!(compared, 264, "the boot prefix grew or shrank");
 }
 
-/// A guest reboot: the kernel's Shutdown, _TPM_Init, the firmware's whole measured boot.
+/// A guest reboot: the kernel's Shutdown, _TPM_Init, the firmware's whole measured boot, and the
+/// next kernel's null primary key and session.
 #[test]
-fn a_reboot_replays_up_to_the_kernel() {
+fn a_reboot_replays_up_to_the_kernels_first_session() {
     let (compared, stopped) = replay("09-reboot");
-    assert_eq!(stopped.as_deref(), Some("CreatePrimary"));
-    assert!(compared > 130, "only {compared} commands replayed");
+    assert_eq!(stopped.as_deref(), Some("GetRandom under a session"));
+    assert!(compared > 136, "only {compared} commands replayed");
 }

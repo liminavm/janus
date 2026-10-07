@@ -52,15 +52,19 @@ material zeroizes on drop, has no `Debug` and no `Clone`, and compares with `sub
 Each property is held by the cheapest checker that can hold it, and every checker is armed:
 
 - `cargo test` — unit tests beside the code; `tests/commands.rs` (behaviour guests never
-  exercise: wrong passwords, lockout, locality, malformed session areas); `tests/replay.rs` (the
-  guest corpus against swtpm's answers); `tests/every_sequence.rs` (exhaustive walks of the
-  lifecycle against a model, which also assert they reached every case they exist for).
+  exercise: wrong passwords, lockout, locality, malformed session areas, refused contexts);
+  `tests/replay.rs` (the guest corpus against swtpm's answers, up to the first command an HMAC
+  or policy session protects); `tests/sessions.rs` (a client written from the specification
+  that takes over from there: salted, bound and encrypting sessions, every response HMAC
+  checked); `tests/every_sequence.rs` (exhaustive walks of the lifecycle against a model, which
+  also assert they reached every case they exist for).
 - `cargo kani` — proofs in `#[cfg(kani)] mod proofs` beside the code they prove, for properties
   over every input of a bounded size: the wire reader, framing, handle classification, response
   code assembly.
 - `cargo +nightly fuzz run <target>` in `fuzz/` (its own workspace) — `execute` (one command into
-  a started TPM) and `sequence` (commands, resets and locality changes). Every response must be
-  a well-formed frame. Seed the corpora from the guest captures first:
+  a started TPM), `sequence` (commands, resets and locality changes) and `prepared` (the same,
+  into a TPM already holding a key, a session and saved contexts). Every response must be a
+  well-formed frame. Seed the corpora from the guest captures first:
   `cargo run --manifest-path fuzz/Cargo.toml --bin seed-corpora`.
 - `harness/sabotage/sweep.py` — breaks each guarded property on purpose and checks its witness
   goes red. A new guard gets an entry; an entry that survives is a hole.

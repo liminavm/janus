@@ -213,3 +213,212 @@ fn get_random_returns_at_most_one_digest() {
     assert_eq!(u16::from_be_bytes([r[10], r[11]]), 32);
     assert_eq!(r.len(), 12 + 32);
 }
+
+/// The kernel's null primary template: ECC P-256, restricted decrypt, AES-128-CFB, noDA.
+const PARENT: [u8; 26] = [
+    0x00, 0x23, 0x00, 0x0B, 0x00, 0x03, 0x04, 0x72, 0x00, 0x00, 0x00, 0x06, 0x00, 0x80, 0x00, 0x43,
+    0x00, 0x10, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+];
+const NULL: u32 = 0x4000_0007;
+
+/// `TPM2_CreatePrimary(hierarchy)` with `template` (a `TPMT_PUBLIC`) and empty everything else.
+fn create_primary(hierarchy: u32, template: &[u8]) -> Vec<u8> {
+    let mut body = hierarchy.to_be_bytes().to_vec();
+    body.extend(area(&[password(b"")]));
+    body.extend_from_slice(&[0, 4, 0, 0, 0, 0]);
+    body.extend(tpm2b(template));
+    body.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    cmd(SESSIONS, 0x131, &body)
+}
+
+/// `template` with its `TPMA_OBJECT` replaced.
+fn with_attributes(template: &[u8], attrs: u32) -> Vec<u8> {
+    let mut t = template.to_vec();
+    t[4..8].copy_from_slice(&attrs.to_be_bytes());
+    t
+}
+
+fn context_save(handle: u32) -> Vec<u8> {
+    cmd(NO_SESSIONS, 0x162, &handle.to_be_bytes())
+}
+
+fn context_load(context: &[u8]) -> Vec<u8> {
+    cmd(NO_SESSIONS, 0x161, context)
+}
+
+fn flush(handle: u32) -> Vec<u8> {
+    cmd(NO_SESSIONS, 0x165, &handle.to_be_bytes())
+}
+
+fn shutdown(state: bool) -> Vec<u8> {
+    cmd(NO_SESSIONS, 0x145, &[0, state as u8])
+}
+
+fn startup(state: bool) -> Vec<u8> {
+    cmd(NO_SESSIONS, 0x144, &[0, state as u8])
+}
+
+/// `TPM2_StartAuthSession` with explicit fields.
+fn start_session(
+    tpm_key: u32,
+    bind: u32,
+    nonce: &[u8],
+    salt: &[u8],
+    kind: u8,
+    symmetric: &[u8],
+) -> Vec<u8> {
+    let mut body = tpm_key.to_be_bytes().to_vec();
+    body.extend_from_slice(&bind.to_be_bytes());
+    body.extend(tpm2b(nonce));
+    body.extend(tpm2b(salt));
+    body.push(kind);
+    body.extend_from_slice(symmetric);
+    body.extend_from_slice(&0x000Bu16.to_be_bytes());
+    cmd(NO_SESSIONS, 0x176, &body)
+}
+
+const SYM_NULL: [u8; 2] = [0x00, 0x10];
+
+/// An unsalted, unbound HMAC session.
+fn plain_session() -> Vec<u8> {
+    start_session(NULL, NULL, &[0x33; 16], &[], 0, &SYM_NULL)
+}
+
+/// Runs `c` and returns its response, which must be a success.
+fn ok(tpm: &mut Janus<Zero>, c: &[u8]) -> Vec<u8> {
+    let r = tpm.execute(Locality::ZERO, c);
+    assert_eq!(rc(&r), 0, "{c:02x?}");
+    r
+}
+
+/// A saved context, as the parameters of the ContextSave response that carried it.
+fn saved(tpm: &mut Janus<Zero>, handle: u32) -> Vec<u8> {
+    ok(tpm, &context_save(handle))[10..].to_vec()
+}
+
+#[test]
+fn create_primary_refuses_templates_in_the_reference_order() {
+    let mut tpm = started();
+    // fixedTPM without fixedParent: TPM_RC_ATTRIBUTES on inPublic (CreateChecks).
+    assert_eq!(run(&mut tpm, &create_primary(NULL, &with_attributes(&PARENT, 0x0003_0462))), 0x2C2);
+    // An unimplemented curve fails to unmarshal: TPM_RC_CURVE on inPublic.
+    let mut p384 = PARENT.to_vec();
+    p384[19] = 4;
+    assert_eq!(run(&mut tpm, &create_primary(NULL, &p384)), 0x2E6);
+    // A hierarchy handle that is not one: TPM_RC_VALUE on handle 1.
+    assert_eq!(run(&mut tpm, &create_primary(LOCKOUT, &PARENT)), 0x184);
+    // Three objects fill the transient slots; the fourth is TPM_RC_OBJECT_MEMORY.
+    for _ in 0..3 {
+        ok(&mut tpm, &create_primary(NULL, &PARENT));
+    }
+    assert_eq!(run(&mut tpm, &create_primary(NULL, &PARENT)), 0x902);
+}
+
+#[test]
+fn context_commands_refuse_what_is_not_there() {
+    let mut tpm = started();
+    // Nothing in slot 0: TPM_RC_REFERENCE_H0. A PCR is not a context: TPM_RC_VALUE on handle 1.
+    assert_eq!(run(&mut tpm, &context_save(0x8000_0000)), 0x910);
+    assert_eq!(run(&mut tpm, &context_save(0)), 0x184);
+    // FlushContext names its handle as a parameter: TPM_RC_HANDLE / TPM_RC_VALUE on it.
+    assert_eq!(run(&mut tpm, &flush(0x8000_0000)), 0x1CB);
+    assert_eq!(run(&mut tpm, &flush(0x0200_0000)), 0x1CB);
+    assert_eq!(run(&mut tpm, &flush(OWNER)), 0x1C4);
+}
+
+#[test]
+fn a_context_that_was_tampered_with_or_names_no_context_is_refused() {
+    let mut tpm = started();
+    ok(&mut tpm, &create_primary(NULL, &PARENT));
+    let context = saved(&mut tpm, 0x8000_0000);
+    // A flipped bit in the encrypted part: TPM_RC_INTEGRITY on the context.
+    let mut tampered = context.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    assert_eq!(run(&mut tpm, &context_load(&tampered)), 0x1DF);
+    // A saved handle TPMI_DH_SAVED does not allow, here a persistent one: TPM_RC_VALUE.
+    for bad in [0x8100_0000u32, 0x8000_0003, 0x4000_0001] {
+        let mut wrong = context.clone();
+        wrong[8..12].copy_from_slice(&bad.to_be_bytes());
+        assert_eq!(run(&mut tpm, &context_load(&wrong)), 0x1C4, "saved handle {bad:#x}");
+    }
+    // The untouched context still loads.
+    ok(&mut tpm, &context_load(&context));
+}
+
+#[test]
+fn start_auth_session_checks_its_parameters_in_the_reference_order() {
+    let mut tpm = started();
+    // A nonce shorter than 16 bytes: TPM_RC_SIZE on nonceCaller.
+    assert_eq!(run(&mut tpm, &start_session(NULL, NULL, &[1; 15], &[], 0, &SYM_NULL)), 0x1D5);
+    // A salt with no key to decrypt it: TPM_RC_VALUE on encryptedSalt.
+    assert_eq!(run(&mut tpm, &start_session(NULL, NULL, &[1; 16], &[1], 0, &SYM_NULL)), 0x2C4);
+    // TPM_SE 2 does not exist: TPM_RC_VALUE on sessionType.
+    assert_eq!(run(&mut tpm, &start_session(NULL, NULL, &[1; 16], &[], 2, &SYM_NULL)), 0x3C4);
+    // AES-128 in OFB: TPM_RC_MODE on symmetric.
+    let ofb = [0x00, 0x06, 0x00, 0x80, 0x00, 0x41];
+    assert_eq!(run(&mut tpm, &start_session(NULL, NULL, &[1; 16], &[], 0, &ofb)), 0x4C9);
+    // A key that does not decrypt: TPM_RC_ATTRIBUTES on tpmKey.
+    let signer = [
+        0x00, 0x23, 0x00, 0x0B, 0x00, 0x04, 0x00, 0x72, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00,
+        0x03, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let r = ok(&mut tpm, &create_primary(NULL, &signer));
+    let key = u32::from_be_bytes(r[10..14].try_into().unwrap());
+    assert_eq!(run(&mut tpm, &start_session(key, NULL, &[1; 16], &[1; 68], 0, &SYM_NULL)), 0x182);
+    // A loaded key that is not there any more: TPM_RC_REFERENCE_H0.
+    ok(&mut tpm, &flush(key));
+    assert_eq!(run(&mut tpm, &start_session(key, NULL, &[1; 16], &[1; 68], 0, &SYM_NULL)), 0x910);
+}
+
+/// Shutdown(STATE) and _TPM_Init, then the Startup that makes the next one a Resume, a Restart
+/// or a Reset.
+fn power_cycle(tpm: &mut Janus<Zero>, shutdown_state: bool, startup_state: bool) {
+    ok(tpm, &shutdown(shutdown_state));
+    tpm.init();
+    ok(tpm, &startup(startup_state));
+}
+
+#[test]
+fn saved_contexts_outlive_a_resume_and_a_restart_but_not_a_reset() {
+    for (shutdown_state, startup_state, loads) in
+        [(true, true, true), (true, false, true), (false, false, false)]
+    {
+        let mut tpm = started();
+        ok(&mut tpm, &create_primary(NULL, &PARENT));
+        let object = saved(&mut tpm, 0x8000_0000);
+        let r = ok(&mut tpm, &plain_session());
+        let handle = u32::from_be_bytes(r[10..14].try_into().unwrap());
+        let session = saved(&mut tpm, handle);
+        power_cycle(&mut tpm, shutdown_state, startup_state);
+        let expected = if loads { 0 } else { 0x1DF };
+        let what = (shutdown_state, startup_state);
+        assert_eq!(run(&mut tpm, &context_load(&object)), expected, "object, {what:?}");
+        assert_eq!(run(&mut tpm, &context_load(&session)), expected, "session, {what:?}");
+    }
+}
+
+#[test]
+fn an_st_clear_objects_context_dies_at_a_restart() {
+    let mut tpm = started();
+    // PARENT with stClear.
+    ok(&mut tpm, &create_primary(NULL, &with_attributes(&PARENT, 0x0003_0476)));
+    let object = saved(&mut tpm, 0x8000_0000);
+    power_cycle(&mut tpm, true, true);
+    ok(&mut tpm, &context_load(&object));
+    ok(&mut tpm, &flush(0x8000_0000));
+    power_cycle(&mut tpm, true, false);
+    assert_eq!(run(&mut tpm, &context_load(&object)), 0x1DF);
+}
+
+#[test]
+fn saving_a_context_after_shutdown_state_makes_the_resume_a_reset() {
+    let mut tpm = started();
+    let r = ok(&mut tpm, &plain_session());
+    let handle = u32::from_be_bytes(r[10..14].try_into().unwrap());
+    ok(&mut tpm, &shutdown(true));
+    // ContextSave changes what Shutdown saved (`RETURN_IF_ORDERLY`).
+    saved(&mut tpm, handle);
+    tpm.init();
+    assert_eq!(run(&mut tpm, &startup(true)), 0x1C4);
+    ok(&mut tpm, &startup(false));
+}

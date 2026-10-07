@@ -6,9 +6,15 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Cc {
     HierarchyChangeAuth,
+    CreatePrimary,
     SelfTest,
     Startup,
     Shutdown,
+    ContextLoad,
+    ContextSave,
+    FlushContext,
+    ReadPublic,
+    StartAuthSession,
     GetCapability,
     GetRandom,
     PcrRead,
@@ -16,11 +22,17 @@ pub enum Cc {
 }
 
 /// The implemented commands in `TPM_CC` order, which is the order `TPM_CAP_COMMANDS` lists them.
-pub const IMPLEMENTED: [Cc; 8] = [
+pub const IMPLEMENTED: [Cc; 14] = [
     Cc::HierarchyChangeAuth,
+    Cc::CreatePrimary,
     Cc::SelfTest,
     Cc::Startup,
     Cc::Shutdown,
+    Cc::ContextLoad,
+    Cc::ContextSave,
+    Cc::FlushContext,
+    Cc::ReadPublic,
+    Cc::StartAuthSession,
     Cc::GetCapability,
     Cc::GetRandom,
     Cc::PcrRead,
@@ -28,11 +40,13 @@ pub const IMPLEMENTED: [Cc; 8] = [
 ];
 
 /// How a command uses its handles and sessions: the parts of `TPMA_CC` and of the reference's
-/// command attribute table the dispatcher acts on.
+/// command attribute table (`CommandAttributeData.h`) the dispatcher acts on.
 #[derive(Clone, Copy, Debug)]
 pub struct Attributes {
     /// May write NV (`TPMA_CC.nv`).
     pub nv: bool,
+    /// Flushes any transient object in its handle area (`TPMA_CC.flushed`).
+    pub flushed: bool,
     /// Handles in the command's handle area (`TPMA_CC.cHandles`).
     pub handles: u8,
     /// How many of those, from the first, need authorization.
@@ -41,19 +55,36 @@ pub struct Attributes {
     pub response_handle: bool,
     /// The command refuses an authorization area (`TPM_ST_SESSIONS` is `TPM_RC_AUTH_CONTEXT`).
     pub no_sessions: bool,
+    /// Its first parameter is a `TPM2B` a session may encrypt (`DECRYPT_2`).
+    pub decrypt: bool,
+    /// Its first response parameter is a `TPM2B` a session may encrypt (`ENCRYPT_2`).
+    pub encrypt: bool,
 }
 
-const fn attrs(nv: bool, handles: u8, auth_handles: u8, no_sessions: bool) -> Attributes {
-    Attributes { nv, handles, auth_handles, response_handle: false, no_sessions }
-}
+const NONE: Attributes = Attributes {
+    nv: false,
+    flushed: false,
+    handles: 0,
+    auth_handles: 0,
+    response_handle: false,
+    no_sessions: false,
+    decrypt: false,
+    encrypt: false,
+};
 
 impl Cc {
     pub const fn code(self) -> u32 {
         match self {
             Cc::HierarchyChangeAuth => 0x129,
+            Cc::CreatePrimary => 0x131,
             Cc::SelfTest => 0x143,
             Cc::Startup => 0x144,
             Cc::Shutdown => 0x145,
+            Cc::ContextLoad => 0x161,
+            Cc::ContextSave => 0x162,
+            Cc::FlushContext => 0x165,
+            Cc::ReadPublic => 0x173,
+            Cc::StartAuthSession => 0x176,
             Cc::GetCapability => 0x17A,
             Cc::GetRandom => 0x17B,
             Cc::PcrRead => 0x17E,
@@ -68,14 +99,33 @@ impl Cc {
     /// From the reference's `CommandAttributeData.h`.
     pub const fn attributes(self) -> Attributes {
         match self {
-            Cc::HierarchyChangeAuth => attrs(true, 1, 1, false),
-            Cc::SelfTest => attrs(true, 0, 0, false),
-            Cc::Startup => attrs(true, 0, 0, true),
-            Cc::Shutdown => attrs(true, 0, 0, false),
-            Cc::GetCapability => attrs(false, 0, 0, false),
-            Cc::GetRandom => attrs(false, 0, 0, false),
-            Cc::PcrRead => attrs(false, 0, 0, false),
-            Cc::PcrExtend => attrs(true, 1, 1, false),
+            Cc::HierarchyChangeAuth => {
+                Attributes { nv: true, handles: 1, auth_handles: 1, decrypt: true, ..NONE }
+            }
+            Cc::CreatePrimary => Attributes {
+                handles: 1,
+                auth_handles: 1,
+                response_handle: true,
+                decrypt: true,
+                encrypt: true,
+                ..NONE
+            },
+            Cc::SelfTest | Cc::Shutdown => Attributes { nv: true, ..NONE },
+            Cc::Startup => Attributes { nv: true, no_sessions: true, ..NONE },
+            Cc::ContextLoad => Attributes { response_handle: true, no_sessions: true, ..NONE },
+            Cc::ContextSave => Attributes { handles: 1, no_sessions: true, ..NONE },
+            Cc::FlushContext => Attributes { no_sessions: true, ..NONE },
+            Cc::ReadPublic => Attributes { handles: 1, encrypt: true, ..NONE },
+            Cc::StartAuthSession => Attributes {
+                handles: 2,
+                response_handle: true,
+                decrypt: true,
+                encrypt: true,
+                ..NONE
+            },
+            Cc::GetCapability | Cc::PcrRead => NONE,
+            Cc::GetRandom => Attributes { encrypt: true, ..NONE },
+            Cc::PcrExtend => Attributes { nv: true, handles: 1, auth_handles: 1, ..NONE },
         }
     }
 
@@ -84,6 +134,7 @@ impl Cc {
         let a = self.attributes();
         (self.code() & 0xFFFF)
             | ((a.nv as u32) << 22)
+            | ((a.flushed as u32) << 24)
             | ((a.handles as u32) << 25)
             | ((a.response_handle as u32) << 28)
     }
@@ -107,5 +158,9 @@ mod tests {
         assert_eq!(Cc::PcrExtend.tpma_cc(), 0x0240_0182);
         // TPMA_CC_INITIALIZER(0x017A, 0, 0, 0, 0, 0, 0, 0, 0)
         assert_eq!(Cc::GetCapability.tpma_cc(), 0x0000_017A);
+        // TPMA_CC_INITIALIZER(0x0176, 0, 0, 0, 0, 2, 1, 0, 0)
+        assert_eq!(Cc::StartAuthSession.tpma_cc(), 0x1400_0176);
+        // TPMA_CC_INITIALIZER(0x0131, 0, 0, 0, 0, 1, 1, 0, 0)
+        assert_eq!(Cc::CreatePrimary.tpma_cc(), 0x1200_0131);
     }
 }

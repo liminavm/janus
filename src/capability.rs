@@ -144,15 +144,22 @@ fn variable(v: &Variable) -> Vec<(u32, u32)> {
 const PERMANENT: &[u32] =
     &[rh::OWNER, rh::NULL, rh::PW, rh::LOCKOUT, rh::ENDORSEMENT, rh::PLATFORM];
 
-/// The algorithms `TPM_CAP_ALGS` lists, with their `TPMA_ALGORITHM`.
+/// The algorithms `TPM_CAP_ALGS` lists, with their `TPMA_ALGORITHM`, in id order: every one a
+/// client may name in a command janus implements, with the attributes the reference gives it.
 ///
 /// `TPMA_ALGORITHM`: asymmetric 0x1, symmetric 0x2, hash 0x4, object 0x8, signing 0x100,
 /// encrypting 0x200, method 0x400.
 const ALGS: &[(u16, u32)] = &[
+    (crate::alg::id::RSA, 0x9),
+    (crate::alg::id::HMAC, 0x104),
     (crate::alg::id::AES, 0x2),
-    (crate::alg::id::KEYEDHASH, 0x308),
+    (crate::alg::id::KEYEDHASH, 0x30C),
     (crate::alg::id::SHA256, 0x4),
     (crate::alg::id::NULL, 0x0),
+    (crate::alg::id::RSASSA, 0x101),
+    (crate::alg::id::RSAES, 0x201),
+    (crate::alg::id::RSAPSS, 0x101),
+    (crate::alg::id::OAEP, 0x201),
     (crate::alg::id::ECDSA, 0x101),
     (crate::alg::id::ECDH, 0x401),
     (crate::alg::id::ECC, 0x9),

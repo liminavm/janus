@@ -620,3 +620,36 @@ fn the_clock_runs_while_the_tpm_does_and_time_since_init() {
     assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup(false))), 0);
     assert_eq!(read_clock(&mut tpm).4, 0);
 }
+
+/// `TPM_CAP_ALGS` lists every algorithm a client may name in a command janus implements, with
+/// the `TPMA_ALGORITHM` swtpm reports for it (the corpus's GetCapability answers).
+#[test]
+fn the_algorithm_list_is_every_algorithm_janus_implements() {
+    let mut tpm = started();
+    let rsp = ok(&mut tpm, &cmd(NO_SESSIONS, 0x17A, &get_capability(0, 0, 64)));
+    let n = u32::from_be_bytes(rsp[15..19].try_into().unwrap()) as usize;
+    let listed: Vec<(u16, u32)> = (0..n)
+        .map(|i| {
+            let e = &rsp[19 + 6 * i..25 + 6 * i];
+            (u16::from_be_bytes([e[0], e[1]]), u32::from_be_bytes(e[2..6].try_into().unwrap()))
+        })
+        .collect();
+    let expected = [
+        (0x0001, 0x009), // RSA
+        (0x0005, 0x104), // HMAC
+        (0x0006, 0x002), // AES
+        (0x0008, 0x30C), // KEYEDHASH
+        (0x000B, 0x004), // SHA256
+        (0x0010, 0x000), // NULL
+        (0x0014, 0x101), // RSASSA
+        (0x0015, 0x201), // RSAES
+        (0x0016, 0x101), // RSAPSS
+        (0x0017, 0x201), // OAEP
+        (0x0018, 0x101), // ECDSA
+        (0x0019, 0x401), // ECDH
+        (0x0023, 0x009), // ECC
+        (0x0025, 0x008), // SYMCIPHER
+        (0x0043, 0x202), // CFB
+    ];
+    assert_eq!(listed, expected);
+}

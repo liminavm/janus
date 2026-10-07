@@ -422,3 +422,123 @@ fn saving_a_context_after_shutdown_state_makes_the_resume_a_reset() {
     assert_eq!(run(&mut tpm, &startup(true)), 0x1C4);
     ok(&mut tpm, &startup(false));
 }
+
+/// swtpm's answer to `TPM2_ECC_Parameters(TPM_ECC_NIST_P256)`, from `tests/corpus/08-openssl`.
+const P256_PARAMETERS: &str = "8001000000e300000000000301000020000b00100020ffffffff000000010000\
+    00000000000000000000ffffffffffffffffffffffff0020ffffffff0000000100000000000000000000000\
+    0fffffffffffffffffffffffc00205ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27\
+    d2604b00206b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c29600204fe342e2f\
+    e1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f50020ffffffff00000000ffffffffffff\
+    ffffbce6faada7179e84f3b9cac2fc632551000101";
+
+fn hex(s: &str) -> Vec<u8> {
+    let s: String = s.split_whitespace().collect();
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+}
+
+#[test]
+fn ecc_parameters_answers_as_swtpm_does() {
+    let mut tpm = started();
+    let r = ok(&mut tpm, &cmd(NO_SESSIONS, 0x178, &[0, 3]));
+    assert_eq!(r, hex(P256_PARAMETERS));
+    // Any other curve is TPM_RC_CURVE on the parameter.
+    assert_eq!(run(&mut tpm, &cmd(NO_SESSIONS, 0x178, &[0, 4])), 0x1E6);
+}
+
+#[test]
+fn test_parms_accepts_what_janus_implements() {
+    let mut tpm = started();
+    // The corpus's own questions, which swtpm answered this way.
+    for (parms, expected) in [
+        ("0025000600800043", 0),             // SYMCIPHER, AES-128-CFB
+        ("0023000600800043001000030010", 0), // ECC P-256 storage parameters
+        ("00230010001000030010", 0),         // ECC P-256, nothing else
+        ("000100100010100000000000", 0x1C4), // RSA-4096: TPM_RC_VALUE
+    ] {
+        assert_eq!(run(&mut tpm, &cmd(NO_SESSIONS, 0x18A, &hex(parms))), expected, "{parms}");
+    }
+    // Where janus implements less than swtpm: RSA-1024 and -3072, and the ECC curves but
+    // P-256, which swtpm accepts and janus refuses as the reference would refuse a curve or
+    // key size it was built without.
+    for (parms, expected) in [
+        ("000100100010040000000000", 0x1C4),
+        ("0001001000100c0000000000", 0x1C4),
+        ("00230010001000010010", 0x1E6),
+        ("00230010001000050010", 0x1E6),
+    ] {
+        assert_eq!(run(&mut tpm, &cmd(NO_SESSIONS, 0x18A, &hex(parms))), expected, "{parms}");
+    }
+}
+
+/// `TPM2_Hash(data, SHA-256, hierarchy)`; returns the digest, and the ticket's hierarchy and
+/// HMAC.
+fn hash(tpm: &mut Janus<Counting>, data: &[u8], hierarchy: u32) -> (Vec<u8>, u32, Vec<u8>) {
+    let body = [tpm2b(data), vec![0, 0x0B], hierarchy.to_be_bytes().to_vec()].concat();
+    let r = tpm.execute(Locality::ZERO, &cmd(NO_SESSIONS, 0x17D, &body));
+    assert_eq!(rc(&r), 0);
+    assert_eq!(r[44..46], [0x80, 0x24], "TPM_ST_HASHCHECK");
+    let h = u32::from_be_bytes(r[46..50].try_into().unwrap());
+    (r[12..44].to_vec(), h, r[52..].to_vec())
+}
+
+/// Randomness that differs from draw to draw, so each hierarchy gets its own proof.
+struct Counting(u8);
+
+impl Platform for Counting {
+    fn fill_random(&mut self, buf: &mut [u8]) {
+        for b in buf {
+            self.0 = self.0.wrapping_add(1);
+            *b = self.0;
+        }
+    }
+}
+
+#[test]
+fn hash_tickets_only_what_the_tpm_could_not_have_produced() {
+    use sha2::Digest as _;
+    let mut tpm = Janus::manufacture(Counting(0));
+    tpm.init();
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &cmd(NO_SESSIONS, 0x144, &[0, 0]))), 0);
+    let (digest, h, ticket) = hash(&mut tpm, b"message", OWNER);
+    assert_eq!(digest, sha2::Sha256::digest(b"message").to_vec());
+    assert_eq!((h, ticket.len()), (OWNER, 32));
+    // The same message under the same hierarchy gets the same ticket; another hierarchy's
+    // proof gives another.
+    assert_eq!(hash(&mut tpm, b"message", OWNER).2, ticket);
+    assert_ne!(hash(&mut tpm, b"message", 0x4000_000B).2, ticket);
+    // A NULL ticket under the NULL hierarchy, and for data that starts like something the TPM
+    // signs (TPM_GENERATED_VALUE), so it cannot be passed off as an attestation.
+    let (_, h, ticket) = hash(&mut tpm, b"message", NULL);
+    assert_eq!((h, ticket.len()), (NULL, 0));
+    let (_, h, ticket) = hash(&mut tpm, b"\xffTCGmessage", OWNER);
+    assert_eq!((h, ticket.len()), (NULL, 0));
+    // Shorter than TPM_GENERATED_VALUE is safe.
+    assert_eq!(hash(&mut tpm, b"\xffTC", OWNER).2.len(), 32);
+}
+
+#[test]
+fn policy_commands_refuse_what_is_not_a_loaded_policy_session() {
+    use sha2::Digest as _;
+    let mut tpm = started();
+    let hmac = u32::from_be_bytes(ok(&mut tpm, &plain_session())[10..14].try_into().unwrap());
+    let get_digest = |h: u32| cmd(NO_SESSIONS, 0x189, &h.to_be_bytes());
+    // An HMAC session is not a TPMI_SH_POLICY: TPM_RC_VALUE on the handle.
+    assert_eq!(run(&mut tpm, &get_digest(hmac)), 0x184);
+    // A policy handle with nothing loaded under it: TPM_RC_REFERENCE_H0.
+    assert_eq!(run(&mut tpm, &get_digest(0x0300_0001)), 0x910);
+
+    let policy = start_session(NULL, NULL, &[0x33; 16], &[], 1, &SYM_NULL);
+    let p = u32::from_be_bytes(ok(&mut tpm, &policy)[10..14].try_into().unwrap());
+    let command_code =
+        |code: u32| cmd(NO_SESSIONS, 0x16C, &[p.to_be_bytes(), code.to_be_bytes()].concat());
+    // A command janus does not implement: TPM_RC_POLICY_CC on the parameter.
+    assert_eq!(run(&mut tpm, &command_code(0x14F)), 0x1E4);
+    assert_eq!(ok(&mut tpm, &get_digest(p))[12..], [0; 32], "a refused update changes nothing");
+    ok(&mut tpm, &command_code(0x15E));
+    let expected = sha2::Sha256::digest(
+        [&[0; 32][..], &0x16Cu32.to_be_bytes(), &0x15Eu32.to_be_bytes()].concat(),
+    );
+    assert_eq!(ok(&mut tpm, &get_digest(p))[12..], expected[..]);
+    // A second, different command code: TPM_RC_VALUE on the parameter.
+    assert_eq!(run(&mut tpm, &command_code(0x17B)), 0x1C4);
+}

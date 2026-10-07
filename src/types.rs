@@ -240,6 +240,18 @@ wire_struct! {
 }
 
 wire_union! {
+    /// `TPMT_PUBLIC_PARMS`: an object type's parameters without a key, as `TPM2_TestParms`
+    /// asks about them.
+    #[derive(Clone, Copy, Debug)]
+    pub enum PublicParms: u16 [Fmt1::Type] {
+        Rsa = id::RSA => RsaParms,
+        KeyedHash = id::KEYEDHASH => KeyedHashScheme,
+        Ecc = id::ECC => EccParms,
+        SymCipher = id::SYMCIPHER => SymObject,
+    }
+}
+
+wire_union! {
     /// `TPMI_ALG_PUBLIC` with the `TPMU_PUBLIC_PARMS` and `TPMU_PUBLIC_ID` it selects.
     #[derive(Clone, Debug)]
     pub enum PublicKind: u16 [Fmt1::Type] {

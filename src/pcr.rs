@@ -236,6 +236,12 @@ impl Pcrs {
         }
     }
 
+    /// The update counter (`pcrUpdateCounter`), which a policy session that ran `TPM2_PolicyPCR`
+    /// remembers.
+    pub fn counter(&self) -> u32 {
+        self.counter
+    }
+
     pub fn may_extend(p: PcrIndex, locality: Locality) -> bool {
         p.attributes().extend & locality.bit() != 0
     }

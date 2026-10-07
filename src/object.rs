@@ -4,16 +4,17 @@
 //! slots loaded ones live in.
 
 use crate::alg::{Hash, MAX_DIGEST};
-use crate::crypto::{Drbg, EccPrivate};
+use crate::crypto::{self, Drbg, EccPrivate};
 use crate::handle::{handle_type, ht};
 use crate::hierarchy::Hierarchy;
-use crate::marshal::{Marshal, Unmarshal};
-use crate::rc::Fmt1;
+use crate::marshal::{Marshal, Tpm2b, Unmarshal};
+use crate::rc::{At, Fmt0, Fmt1, Rc};
 use crate::types::{
     EccPoint, EccScheme, KeyedHashScheme, MAX_ECC_KEY_BYTES, MAX_SYM_DATA, Name2b, Public,
     PublicKind, RsaScheme, Secret, SensitiveCreate, SymDefObject, SymObject,
 };
-use crate::wire::{Buf, Reader, Writer};
+use crate::wire::{Blame as _, Buf, Reader, Writer};
+use zeroize::Zeroizing;
 
 /// Largest symmetric key (AES-128).
 pub const MAX_SYM_KEY_BYTES: usize = 16;
@@ -148,7 +149,14 @@ pub fn validate_template(
             }
         }
     }
-    // PublicAttributesValidation. nameAlg cannot be NULL: `Hash` has no NULL.
+    validate_public(public, parent)
+}
+
+/// The checks every object's public area passes, created or loaded
+/// (`PublicAttributesValidation`, which ends in `SchemeChecks`). nameAlg cannot be NULL:
+/// `Hash` has no NULL.
+pub fn validate_public(public: &Public, parent: Option<&Object>) -> Result<(), Invalid> {
+    let a = public.attributes;
     if !public.auth_policy.as_slice().is_empty()
         && public.auth_policy.as_slice().len() != public.name_alg.size()
     {
@@ -292,12 +300,33 @@ const PRIMARY_LABEL: &[u8] = b"Primary Object Creation";
 pub fn create_primary(
     seed: &[u8],
     hierarchy: Hierarchy,
-    mut template: Public,
+    template: Public,
     sensitive: SensitiveCreate,
 ) -> Result<Object, Unsupported> {
     let template_name = template.name();
     let mut drbg =
         Drbg::new(seed, PRIMARY_LABEL, &[template_name.as_slice(), sensitive.data.as_slice()]);
+    generate(template, sensitive, &mut drbg, hierarchy, &hierarchy.handle().to_be_bytes())
+}
+
+/// Creates an ordinary object under `parent` (`TPM2_Create`), its secrets drawn from `drbg`,
+/// which the caller seeds from the platform's randomness.
+pub fn create(
+    parent: &Object,
+    template: Public,
+    sensitive: SensitiveCreate,
+    drbg: &mut Drbg,
+) -> Result<Object, Unsupported> {
+    generate(template, sensitive, drbg, parent.hierarchy, parent.qualified_name.as_slice())
+}
+
+fn generate(
+    mut template: Public,
+    sensitive: SensitiveCreate,
+    drbg: &mut Drbg,
+    hierarchy: Hierarchy,
+    parent_qualified_name: &[u8],
+) -> Result<Object, Unsupported> {
     let name_alg = template.name_alg;
     let digest_size = name_alg.size();
     let a = template.attributes;
@@ -318,7 +347,7 @@ pub fn create_primary(
 
     let kind = match &mut template.kind {
         PublicKind::Ecc(e) => {
-            let key = EccPrivate::generate(&mut drbg);
+            let key = EccPrivate::generate(drbg);
             let (x, y) = key.public();
             e.unique = EccPoint {
                 x: Buf::from_slice(&x).expect("a P-256 coordinate fits"),
@@ -354,14 +383,153 @@ pub fn create_primary(
         PublicKind::Rsa(_) => return Err(Unsupported::Rsa),
     };
     let auth = secret(trim(sensitive.user_auth.as_slice()));
-    let qualified_name =
-        qualified_name(name_alg, &hierarchy.handle().to_be_bytes(), &template.name());
+    let qualified_name = qualified_name(name_alg, parent_qualified_name, &template.name());
     Ok(Object {
         public: template,
         sensitive: Sensitive { auth, seed: seed_secret, kind },
         hierarchy,
         qualified_name,
     })
+}
+
+/// Whether `o` can be a parent (`ObjectIsParent`): a restricted decryption key, which
+/// [`validate_template`] has made sure has a symmetric algorithm for its children.
+pub fn is_parent(o: &Object) -> bool {
+    let a = o.public.attributes;
+    a.restricted() && a.decrypt() && !a.sign_encrypt()
+}
+
+/// The largest `TPM2B_PRIVATE` janus makes or accepts: the integrity HMAC, the IV and the
+/// encrypted `TPM2B_SENSITIVE` of the largest object (an RSA one).
+pub const MAX_PRIVATE: usize = (2 + MAX_DIGEST) + (2 + 16) + (2 + MAX_SENSITIVE);
+/// The largest marshalled `TPMT_SENSITIVE`.
+const MAX_SENSITIVE: usize = 2 + (2 + MAX_DIGEST) + (2 + MAX_DIGEST) + (2 + MAX_RSA_PRIME_BYTES);
+
+/// `TPM2B_PRIVATE`.
+pub type Private = Buf<MAX_PRIVATE>;
+
+/// The keys a parent protects a child's private area with (Part 1 §23.3):
+/// `KDFa(parent nameAlg, seedValue, "STORAGE", name, empty, 128)` for AES-128-CFB, and
+/// `KDFa(parent nameAlg, seedValue, "INTEGRITY", empty, empty, digest bits)` for the HMAC.
+fn protection(parent: &Object, name: &[u8]) -> (Zeroizing<[u8; 16]>, Zeroizing<Vec<u8>>) {
+    let h = parent.public.name_alg;
+    let seed = parent.sensitive.seed.as_slice();
+    let bits = crypto::kdfa(h, seed, b"STORAGE", name, &[], 128);
+    let mut key = Zeroizing::new([0u8; 16]);
+    key.copy_from_slice(&bits);
+    let hmac_key = crypto::kdfa(h, seed, b"INTEGRITY", &[], &[], (h.size() * 8) as u32);
+    (key, hmac_key)
+}
+
+/// Wraps `child`'s sensitive area for storage outside the TPM (`SensitiveToPrivate`):
+/// `TPM2B integrity || TPM2B iv || AES-CFB(TPM2B_SENSITIVE)`, the integrity being
+/// `HMAC(integrityKey, iv || encrypted || name)`.
+pub fn wrap(parent: &Object, child: &Object, iv: [u8; 16]) -> Private {
+    let name = child.name();
+    let mut inner = Writer::new();
+    Tpm2b(&child.sensitive).write(&mut inner);
+    let mut data = Zeroizing::new(inner.into_vec());
+    let (key, hmac_key) = protection(parent, name.as_slice());
+    crypto::aes128_cfb_encrypt(&key, &iv, &mut data);
+    let mut ivd = Writer::new();
+    ivd.tpm2b(&iv);
+    let ivd = ivd.into_vec();
+    let tag = crypto::hmac(parent.public.name_alg, &hmac_key, &[&ivd, &data, name.as_slice()]);
+    let mut out = Writer::new();
+    out.tpm2b(&tag);
+    out.bytes(&ivd);
+    out.bytes(&data);
+    Buf::from_slice(&out.into_vec()).expect("a wrapped sensitive area is within MAX_PRIVATE")
+}
+
+/// Unwraps a private area wrapped for the object named `name` under `parent`
+/// (`PrivateToSensitive`). A malformed or forged outer layer is a format-1 error at `at`, the
+/// private area's parameter; a sensitive area that verified but does not decode is
+/// `TPM_RC_SENSITIVE`.
+pub fn unwrap(parent: &Object, name: &Name2b, private: &[u8], at: At) -> Result<Sensitive, Rc> {
+    let mut r = Reader::new(private);
+    let tag = r.tpm2b::<MAX_DIGEST>().at(at)?;
+    let rest = r.bytes(r.remaining()).expect("remaining bytes are there");
+    let (key, hmac_key) = protection(parent, name.as_slice());
+    let expected = crypto::hmac(parent.public.name_alg, &hmac_key, &[rest, name.as_slice()]);
+    if !crypto::constant_time_eq(&expected, tag.get()) {
+        return Err(Rc::Fmt1(Fmt1::Integrity, Some(at)));
+    }
+    let mut r = Reader::new(rest);
+    let iv = r.tpm2b::<16>().at(at)?;
+    let iv: [u8; 16] = iv.get().try_into().map_err(|_| Rc::Fmt1(Fmt1::Value, Some(at)))?;
+    let mut data = Zeroizing::new(r.bytes(r.remaining()).expect("there").to_vec());
+    crypto::aes128_cfb_decrypt(&key, &iv, &mut data);
+    let mut r = Reader::new(&data);
+    let sensitive = Tpm2b::<Sensitive>::read(&mut r).map_err(|_| Fmt0::Sensitive)?.0;
+    r.finish().map_err(|_| Fmt0::Sensitive)?;
+    Ok(sensitive)
+}
+
+/// Builds a loaded object from a public area and the sensitive area unwrapped for it under
+/// `parent` (`ObjectLoad`), blaming `private` and `public` (the command's parameters) as the
+/// reference does.
+///
+/// The reference checks that the two areas belong together (`CryptValidateKeys`) only under a
+/// parent that is not fixedTPM; janus checks under every parent. Under a fixedTPM parent the
+/// integrity check has already proved janus wrapped the pair, so the answers can differ only
+/// for a pair no such parent's integrity check passes.
+pub fn load(
+    parent: &Object,
+    public: Public,
+    sensitive: Sensitive,
+    private: At,
+    public_at: At,
+) -> Result<Object, Rc> {
+    let digest_size = public.name_alg.size();
+    let seed = sensitive.seed.as_slice();
+    if seed.len() > digest_size {
+        return Err(Rc::Fmt1(Fmt1::KeySize, Some(private)));
+    }
+    validate_public(&public, Some(parent)).at(public_at)?;
+    let key_size = Rc::Fmt1(Fmt1::KeySize, Some(private));
+    let binding = Rc::Fmt1(Fmt1::Binding, None);
+    match (&public.kind, &sensitive.kind) {
+        (PublicKind::Ecc(e), SensitiveKind::Ecc(d)) => {
+            let key = EccPrivate::from_bytes(d.as_slice()).ok_or(Rc::Fmt1(Fmt1::KeySize, None))?;
+            let (x, y) = key.public();
+            if e.unique.x.as_slice() != x || e.unique.y.as_slice() != y {
+                return Err(binding);
+            }
+        }
+        (PublicKind::KeyedHash(k), SensitiveKind::KeyedHash(bits)) => {
+            let max = match k.scheme {
+                KeyedHashScheme::Hmac(h) => h.block_size(),
+                KeyedHashScheme::Null(()) => MAX_SYM_DATA,
+            };
+            if bits.as_slice().len() > max || seed.len() != digest_size {
+                return Err(key_size);
+            }
+            if k.unique != unique_digest(public.name_alg, seed, bits.as_slice()) {
+                return Err(binding);
+            }
+        }
+        (PublicKind::SymCipher(s), SensitiveKind::SymCipher(key)) => {
+            if key.as_slice().len() != MAX_SYM_KEY_BYTES || seed.len() != digest_size {
+                return Err(key_size);
+            }
+            if s.unique != unique_digest(public.name_alg, seed, key.as_slice()) {
+                return Err(binding);
+            }
+        }
+        // No RSA object can have been wrapped by janus yet.
+        (PublicKind::Rsa(_), SensitiveKind::Rsa(_)) => {
+            return Err(Rc::Fmt1(Fmt1::Type, Some(public_at)));
+        }
+        _ => return Err(Rc::Fmt1(Fmt1::Type, Some(private))),
+    }
+    let a = public.attributes;
+    if a.restricted() && a.decrypt() && (seed.len() < digest_size / 2 || seed.len() > digest_size) {
+        return Err(Rc::Fmt1(Fmt1::Size, Some(private)));
+    }
+    let qualified_name =
+        qualified_name(public.name_alg, parent.qualified_name.as_slice(), &public.name());
+    Ok(Object { public, sensitive, hierarchy: parent.hierarchy, qualified_name })
 }
 
 /// `nameAlg || H(parent's qualified name || name)`. A primary object's parent is its hierarchy,

@@ -221,6 +221,36 @@ impl EccPublicKey {
     }
 }
 
+/// `TPMS_ALGORITHM_DETAIL_ECC` for a curve (`CryptEccGetParameters`): the field and curve
+/// constants as the reference writes them, `p`, `gX` and `gY` padded to the key size and the
+/// rest in their shortest form. NIST P-256's KDF is KDF1 (SP 800-56A) over SHA-256, and it names
+/// no signing scheme.
+/// `TPM_ALG_KDF1_SP800_56A`.
+const KDF1_SP800_56A: u16 = 0x0020;
+
+pub fn ecc_parameters(curve: crate::types::EccCurve, out: &mut crate::wire::Writer) {
+    const P: &str = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff";
+    const A: &str = "ffffffff00000001000000000000000000000000fffffffffffffffffffffffc";
+    const B: &str = "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b";
+    const GX: &str = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
+    const GY: &str = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
+    const N: &str = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551";
+    let crate::types::EccCurve::NistP256 = curve;
+    out.u16(crate::alg::curve::NIST_P256);
+    out.u16(256);
+    out.u16(KDF1_SP800_56A);
+    out.u16(crate::alg::id::SHA256);
+    out.u16(crate::alg::id::NULL);
+    for c in [P, A, B, GX, GY, N] {
+        let bytes: Vec<u8> = (0..c.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&c[i..i + 2], 16).expect("a hex constant"))
+            .collect();
+        out.tpm2b(&bytes);
+    }
+    out.tpm2b(&[1]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

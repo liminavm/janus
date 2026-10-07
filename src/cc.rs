@@ -10,33 +10,57 @@ pub enum Cc {
     SelfTest,
     Startup,
     Shutdown,
+    Create,
+    Load,
+    Unseal,
     ContextLoad,
     ContextSave,
     FlushContext,
+    PolicyAuthValue,
+    PolicyCommandCode,
     ReadPublic,
     StartAuthSession,
+    EccParameters,
     GetCapability,
     GetRandom,
+    Hash,
     PcrRead,
+    PolicyPcr,
+    PolicyRestart,
     PcrExtend,
+    PolicyGetDigest,
+    TestParms,
+    PolicyPassword,
 }
 
 /// The implemented commands in `TPM_CC` order, which is the order `TPM_CAP_COMMANDS` lists them.
-pub const IMPLEMENTED: [Cc; 14] = [
+pub const IMPLEMENTED: [Cc; 26] = [
     Cc::HierarchyChangeAuth,
     Cc::CreatePrimary,
     Cc::SelfTest,
     Cc::Startup,
     Cc::Shutdown,
+    Cc::Create,
+    Cc::Load,
+    Cc::Unseal,
     Cc::ContextLoad,
     Cc::ContextSave,
     Cc::FlushContext,
+    Cc::PolicyAuthValue,
+    Cc::PolicyCommandCode,
     Cc::ReadPublic,
     Cc::StartAuthSession,
+    Cc::EccParameters,
     Cc::GetCapability,
     Cc::GetRandom,
+    Cc::Hash,
     Cc::PcrRead,
+    Cc::PolicyPcr,
+    Cc::PolicyRestart,
     Cc::PcrExtend,
+    Cc::PolicyGetDigest,
+    Cc::TestParms,
+    Cc::PolicyPassword,
 ];
 
 /// How a command uses its handles and sessions: the parts of `TPMA_CC` and of the reference's
@@ -80,15 +104,27 @@ impl Cc {
             Cc::SelfTest => 0x143,
             Cc::Startup => 0x144,
             Cc::Shutdown => 0x145,
+            Cc::Create => 0x153,
+            Cc::Load => 0x157,
+            Cc::Unseal => 0x15E,
             Cc::ContextLoad => 0x161,
             Cc::ContextSave => 0x162,
             Cc::FlushContext => 0x165,
+            Cc::PolicyAuthValue => 0x16B,
+            Cc::PolicyCommandCode => 0x16C,
             Cc::ReadPublic => 0x173,
             Cc::StartAuthSession => 0x176,
+            Cc::EccParameters => 0x178,
             Cc::GetCapability => 0x17A,
             Cc::GetRandom => 0x17B,
+            Cc::Hash => 0x17D,
             Cc::PcrRead => 0x17E,
+            Cc::PolicyPcr => 0x17F,
+            Cc::PolicyRestart => 0x180,
             Cc::PcrExtend => 0x182,
+            Cc::PolicyGetDigest => 0x189,
+            Cc::TestParms => 0x18A,
+            Cc::PolicyPassword => 0x18C,
         }
     }
 
@@ -123,6 +159,26 @@ impl Cc {
                 encrypt: true,
                 ..NONE
             },
+            Cc::Create => {
+                Attributes { handles: 1, auth_handles: 1, decrypt: true, encrypt: true, ..NONE }
+            }
+            Cc::Load => Attributes {
+                handles: 1,
+                auth_handles: 1,
+                response_handle: true,
+                decrypt: true,
+                encrypt: true,
+                ..NONE
+            },
+            Cc::Unseal => Attributes { handles: 1, auth_handles: 1, encrypt: true, ..NONE },
+            Cc::PolicyPcr => Attributes { handles: 1, decrypt: true, ..NONE },
+            Cc::PolicyAuthValue
+            | Cc::PolicyPassword
+            | Cc::PolicyCommandCode
+            | Cc::PolicyRestart => Attributes { handles: 1, ..NONE },
+            Cc::PolicyGetDigest => Attributes { handles: 1, encrypt: true, ..NONE },
+            Cc::Hash => Attributes { decrypt: true, encrypt: true, ..NONE },
+            Cc::TestParms | Cc::EccParameters => NONE,
             Cc::GetCapability | Cc::PcrRead => NONE,
             Cc::GetRandom => Attributes { encrypt: true, ..NONE },
             Cc::PcrExtend => Attributes { nv: true, handles: 1, auth_handles: 1, ..NONE },

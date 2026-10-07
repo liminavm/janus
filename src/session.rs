@@ -142,6 +142,26 @@ wire_union! {
     }
 }
 
+impl PolicySession {
+    /// `policyDigest := H(policyDigest || parts...)`, the update every policy command makes.
+    pub fn extend(&mut self, parts: &[&[u8]]) {
+        let mut all: Vec<&[u8]> = vec![&self.digest];
+        all.extend_from_slice(parts);
+        let d = self.core.auth_hash.digest(&all);
+        self.digest.copy_from_slice(d.as_slice());
+    }
+
+    /// Back to the state `TPM2_StartAuthSession` left it in, but for its nonces
+    /// (`SessionResetPolicyData`).
+    pub fn restart(&mut self) {
+        self.digest = [0; 32];
+        self.auth_value_needed = false;
+        self.password_needed = false;
+        self.command_code = None;
+        self.pcr_counter = None;
+    }
+}
+
 impl Session {
     pub fn core(&self) -> &Core {
         match self {
@@ -217,7 +237,7 @@ impl SessionTable {
         }
     }
 
-    fn get_mut(&mut self, handle: u32) -> Option<&mut Session> {
+    pub fn get_mut(&mut self, handle: u32) -> Option<&mut Session> {
         match &mut self.slots[slot_index(handle)?] {
             SessionSlot::Loaded(s) if s.handle_type() == handle_type(handle) => Some(s),
             _ => None,
@@ -613,6 +633,7 @@ impl Authorization {
         entity: E,
         auth: &EntityAuth<'_>,
         lockout: &mut Lockout,
+        pcr_counter: u32,
     ) -> Result<Authorized<E>, Rc> {
         let i = self.checked;
         assert!(i < self.auth_handles, "authorize() called for more handles than the command has");
@@ -676,6 +697,10 @@ impl Authorization {
                         }
                         if auth.policy.is_empty() {
                             return Err(Fmt0::AuthUnavailable.into());
+                        }
+                        // CheckPolicyAuthSession, in its order.
+                        if p.pcr_counter.is_some_and(|c| c != pcr_counter) {
+                            return Err(Fmt0::PcrChanged.into());
                         }
                         if !bool::from(p.digest[..].ct_eq(auth.policy)) {
                             return Err(Rc::Fmt1(Fmt1::PolicyFail, Some(at)));
@@ -817,6 +842,10 @@ impl Authorization {
                     area.tpm2b(&hmac);
                     if !e.attributes.continue_session() {
                         flush.push(h);
+                    } else if let Some(Session::Policy(p)) = sessions.get_mut(h) {
+                        // A policy session that authorized a command starts over
+                        // (`UpdateInternalSession`).
+                        p.restart();
                     }
                 }
             }

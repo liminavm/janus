@@ -58,6 +58,13 @@ impl Hash {
         }
     }
 
+    /// The block size, which bounds an HMAC key (`CryptHashGetBlockSize`).
+    pub const fn block_size(self) -> usize {
+        match self {
+            Hash::Sha256 => 64,
+        }
+    }
+
     pub const fn from_id(id: u16) -> Option<Hash> {
         match id {
             id::SHA256 => Some(Hash::Sha256),

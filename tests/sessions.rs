@@ -460,3 +460,233 @@ fn a_session_that_authorizes_nothing_must_encrypt_or_decrypt() {
     let rsp = tpm.execute(Locality::ZERO, &command(0x8002, 0x17B, &[], Some(&area), &params));
     assert_eq!(rc(&rsp), 0x982);
 }
+
+const TPM_SE_POLICY: u8 = 0x01;
+const TPM_SE_TRIAL: u8 = 0x03;
+const NO_SYMMETRIC: [u8; 2] = [0x00, 0x10];
+const AES_128_CFB: [u8; 6] = [0x00, 0x06, 0x00, 0x80, 0x00, 0x43];
+
+/// A storage key in the owner hierarchy: the kernel's template, which allows its authValue.
+fn owner_primary(tpm: &mut Janus<Recorder>) -> u32 {
+    let pw = [RS_PW.to_be_bytes().to_vec(), vec![0, 0, 0, 0, 0]].concat();
+    let template = hex(KERNEL_TEMPLATE);
+    let params = [&[0, 4, 0, 0, 0, 0][..], &tpm2b(&template), &[0, 0], &[0, 0, 0, 0]].concat();
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8002, 0x131, &[RH_OWNER], Some(&pw), &params));
+    assert_eq!(rc(&rsp), 0, "CreatePrimary");
+    u32_at(&rsp, 10)
+}
+
+/// An unsalted, unbound policy or trial session: its session key is empty.
+fn start_policy(tpm: &mut Janus<Recorder>, kind: u8, symmetric: &[u8]) -> Session {
+    let nonce_caller = vec![0x7E; 32];
+    let params = [
+        tpm2b(&nonce_caller),
+        tpm2b(&[]),
+        vec![kind],
+        symmetric.to_vec(),
+        SHA256.to_be_bytes().to_vec(),
+    ]
+    .concat();
+    let rsp =
+        tpm.execute(Locality::ZERO, &command(0x8001, 0x176, &[RH_NULL, RH_NULL], None, &params));
+    assert_eq!(rc(&rsp), 0, "StartAuthSession");
+    let n = u16_at(&rsp, 14) as usize;
+    Session {
+        handle: u32_at(&rsp, 10),
+        key: Vec::new(),
+        nonce_caller,
+        nonce_tpm: rsp[16..16 + n].to_vec(),
+    }
+}
+
+/// `TPML_PCR_SELECTION` for SHA-256 PCR 7.
+const PCR7: [u8; 10] = [0, 0, 0, 1, 0, 0x0B, 3, 0x80, 0, 0];
+
+/// TPM2_PolicyPCR(PCR 7) then TPM2_PolicyAuthValue on `session`; returns the digest it holds.
+fn pcr7_and_auth_value(tpm: &mut Janus<Recorder>, session: u32) -> Vec<u8> {
+    let params = [&tpm2b(&[])[..], &PCR7].concat();
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x17F, &[session], None, &params));
+    assert_eq!(rc(&rsp), 0, "PolicyPCR");
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x16B, &[session], None, &[]));
+    assert_eq!(rc(&rsp), 0, "PolicyAuthValue");
+    policy_digest(tpm, session)
+}
+
+fn policy_digest(tpm: &mut Janus<Recorder>, session: u32) -> Vec<u8> {
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x189, &[session], None, &[]));
+    assert_eq!(rc(&rsp), 0, "PolicyGetDigest");
+    rsp[12..].to_vec()
+}
+
+/// The policy `PolicyPCR(PCR 7 = pcr7) || PolicyAuthValue`, from Part 3 §23.7 and §23.18.
+fn expected_policy(pcr7: &[u8]) -> Vec<u8> {
+    let after_pcr = sha256(&[&[0; 32], &0x17Fu32.to_be_bytes(), &PCR7, &sha256(&[pcr7])]);
+    sha256(&[&after_pcr, &0x16Bu32.to_be_bytes()])
+}
+
+fn pw_area() -> Vec<u8> {
+    [RS_PW.to_be_bytes().to_vec(), vec![0, 0, 0, 0, 0]].concat()
+}
+
+/// `TPMA_OBJECT` fixedTPM | fixedParent | noDA: a sealed object only its policy authorizes.
+const SEALED: u32 = 0x0000_0412;
+/// `TPMA_OBJECT` userWithAuth: its authValue authorizes it too.
+const USER_WITH_AUTH: u32 = 0x0000_0040;
+
+/// `TPMA_OBJECT` sign.
+const SIGN: u32 = 0x0004_0000;
+
+/// Seals `data` under `parent` with authValue `auth` and policy `policy`, and loads it;
+/// returns the sealed object's handle and name, and its private and public areas.
+fn seal(
+    tpm: &mut Janus<Recorder>,
+    parent: u32,
+    auth: &[u8],
+    policy: &[u8],
+    data: &[u8],
+    attributes: u32,
+) -> (u32, Vec<u8>, Vec<u8>, Vec<u8>) {
+    // KEYEDHASH, SHA-256, empty unique.
+    let template = [
+        &[0x00, 0x08, 0x00, 0x0B][..],
+        &attributes.to_be_bytes(),
+        &tpm2b(policy),
+        // An HMAC key names its scheme, HMAC-SHA-256; sealed data has none.
+        if attributes & SIGN != 0 { &[0x00, 0x05, 0x00, 0x0B][..] } else { &[0x00, 0x10] },
+        &[0, 0],
+    ]
+    .concat();
+    let sensitive = [tpm2b(auth), tpm2b(data)].concat();
+    let params = [tpm2b(&sensitive), tpm2b(&template), vec![0, 0], vec![0, 0, 0, 0]].concat();
+    let rsp =
+        tpm.execute(Locality::ZERO, &command(0x8002, 0x153, &[parent], Some(&pw_area()), &params));
+    assert_eq!(rc(&rsp), 0, "Create");
+    let n = u16_at(&rsp, 14) as usize;
+    let private = rsp[16..16 + n].to_vec();
+    let m = u16_at(&rsp, 16 + n) as usize;
+    let public = rsp[18 + n..18 + n + m].to_vec();
+    // The template, but for its unique field, which the TPM fills with H(seedValue || data).
+    assert_eq!(public[..template.len() - 2], template[..template.len() - 2]);
+    assert_eq!(public[template.len() - 2..template.len()], [0, 32], "the unique digest's size");
+    let params = [tpm2b(&private), tpm2b(&public)].concat();
+    let rsp =
+        tpm.execute(Locality::ZERO, &command(0x8002, 0x157, &[parent], Some(&pw_area()), &params));
+    assert_eq!(rc(&rsp), 0, "Load");
+    let handle = u32_at(&rsp, 10);
+    let name = rsp[20..20 + u16_at(&rsp, 18) as usize].to_vec();
+    assert_eq!(
+        name,
+        [&SHA256.to_be_bytes()[..], &sha256(&[&public])].concat(),
+        "the object's name"
+    );
+    (handle, name, private, public)
+}
+
+/// TPM2_Unseal of `item` (named `name`, authValue `auth`) under the policy session `s`, its
+/// response encrypted; returns the response code and, on success, the decrypted data.
+fn unseal(
+    tpm: &mut Janus<Recorder>,
+    s: &mut Session,
+    item: u32,
+    name: &[u8],
+    auth: &[u8],
+) -> (u32, Vec<u8>) {
+    let cp = sha256(&[&0x15Eu32.to_be_bytes(), name]);
+    let area = s.entry(&cp, CONTINUE | ENCRYPT, auth);
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8002, 0x15E, &[item], Some(&area), &[]));
+    if rc(&rsp) != 0 {
+        return (rc(&rsp), Vec::new());
+    }
+    let size = u32_at(&rsp, 10) as usize;
+    let out = &rsp[14..14 + size];
+    let rp = sha256(&[&0u32.to_be_bytes(), &0x15Eu32.to_be_bytes(), out]);
+    let caller = s.nonce_caller.clone();
+    let rest = s.check(&rp, CONTINUE | ENCRYPT, auth, &rsp[14 + size..]);
+    assert!(rest.is_empty());
+    let keystream = kdfa(&[&s.key[..], auth].concat(), "CFB", &s.nonce_tpm, &caller, 256);
+    let mut bytes = out[2..].to_vec();
+    cfb(&keystream, &mut bytes, false);
+    (0, bytes)
+}
+
+#[test]
+fn a_secret_sealed_to_pcr7_and_a_password_unseals_until_pcr7_moves() {
+    let (mut tpm, _) = started();
+    let srk = owner_primary(&mut tpm);
+
+    // A trial session computes the policy without checking it.
+    let trial = start_policy(&mut tpm, TPM_SE_TRIAL, &NO_SYMMETRIC);
+    let policy = pcr7_and_auth_value(&mut tpm, trial.handle);
+    assert_eq!(policy, expected_policy(&[0; 32]), "the trial policy digest");
+
+    let (item, name, _, _) = seal(&mut tpm, srk, b"pin", &policy, b"disk key", SEALED);
+
+    let mut s = start_policy(&mut tpm, TPM_SE_POLICY, &AES_128_CFB);
+    assert_eq!(pcr7_and_auth_value(&mut tpm, s.handle), policy);
+    assert_eq!(unseal(&mut tpm, &mut s, item, &name, b"pin"), (0, b"disk key".to_vec()));
+    // A policy session that authorized a command starts over.
+    assert_eq!(policy_digest(&mut tpm, s.handle), vec![0; 32]);
+
+    // The wrong authValue is BAD_AUTH on the session; noDA keeps it from counting.
+    pcr7_and_auth_value(&mut tpm, s.handle);
+    assert_eq!(unseal(&mut tpm, &mut s, item, &name, b"pun").0, 0x9A2);
+
+    // PCR 7 moves after the policy was satisfied: TPM_RC_PCR_CHANGED.
+    let extend = [&1u32.to_be_bytes()[..], &SHA256.to_be_bytes(), &[0xAB; 32]].concat();
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8002, 0x182, &[7], Some(&pw_area()), &extend));
+    assert_eq!(rc(&rsp), 0, "PCR_Extend");
+    assert_eq!(unseal(&mut tpm, &mut s, item, &name, b"pin").0, 0x128);
+
+    // Satisfied afresh against the new PCR 7, the policy is a different policy:
+    // TPM_RC_POLICY_FAIL on session 1.
+    let restart = tpm.execute(Locality::ZERO, &command(0x8001, 0x180, &[s.handle], None, &[]));
+    assert_eq!(rc(&restart), 0, "PolicyRestart");
+    assert_eq!(policy_digest(&mut tpm, s.handle), vec![0; 32]);
+    let now = pcr7_and_auth_value(&mut tpm, s.handle);
+    assert_eq!(now, expected_policy(&sha256(&[&[0; 32], &[0xAB; 32]])));
+    assert_eq!(unseal(&mut tpm, &mut s, item, &name, b"pin").0, 0x99D);
+}
+
+#[test]
+fn load_refuses_private_areas_in_the_reference_order() {
+    let (mut tpm, _) = started();
+    let srk = owner_primary(&mut tpm);
+    let (item, _, private, public) =
+        seal(&mut tpm, srk, b"", &[0x11; 32], b"x", SEALED | USER_WITH_AUTH);
+    let load = |tpm: &mut Janus<Recorder>, parent: u32, private: &[u8]| {
+        let params = [tpm2b(private), tpm2b(&public)].concat();
+        rc(&tpm
+            .execute(Locality::ZERO, &command(0x8002, 0x157, &[parent], Some(&pw_area()), &params)))
+    };
+    // TPM_RC_SIZE on the private area for an empty one.
+    assert_eq!(load(&mut tpm, srk, &[]), 0x1D5);
+    // TPM_RC_INTEGRITY on it for any flipped byte, the integrity, the IV or the ciphertext.
+    for i in [2, 2 + 32 + 2, private.len() - 1] {
+        let mut bad = private.clone();
+        bad[i] ^= 1;
+        assert_eq!(load(&mut tpm, srk, &bad), 0x1DF, "flipped byte {i}");
+    }
+    // With another public area, which is another name, the integrity fails: the name is
+    // bound into it.
+    let mut other = public.clone();
+    other[10] ^= 1;
+    let params = [tpm2b(&private), tpm2b(&other)].concat();
+    let rsp =
+        tpm.execute(Locality::ZERO, &command(0x8002, 0x157, &[srk], Some(&pw_area()), &params));
+    assert_eq!(rc(&rsp), 0x1DF, "another object's public area");
+    // Under an object that is not a parent: TPM_RC_TYPE on the parent handle.
+    assert_eq!(load(&mut tpm, item, &private), 0x18A);
+    // Unsealing a key that is not a sealed object: TPM_RC_TYPE on its handle.
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8002, 0x15E, &[srk], Some(&pw_area()), &[]));
+    assert_eq!(rc(&rsp), 0x18A);
+    // An HMAC key is a keyed-hash object too, but not data to hand out: TPM_RC_ATTRIBUTES on
+    // its handle. (Flushed after, to keep the slot count below.)
+    let (key, ..) = seal(&mut tpm, srk, b"", &[0x11; 32], b"k", SEALED | USER_WITH_AUTH | SIGN);
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8002, 0x15E, &[key], Some(&pw_area()), &[]));
+    assert_eq!(rc(&rsp), 0x182);
+    let flush = command(0x8001, 0x165, &[], None, &key.to_be_bytes());
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &flush)), 0);
+    // One slot is left after the key and the sealed object; filling it leaves none.
+    assert_eq!(load(&mut tpm, srk, &private), 0);
+    assert_eq!(load(&mut tpm, srk, &private), 0x902, "TPM_RC_OBJECT_MEMORY");
+}

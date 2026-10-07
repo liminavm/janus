@@ -25,7 +25,9 @@ use crate::cc::Cc;
 use crate::command::{self, Command};
 use crate::context::{self, Context, Epoch, SavedHandle};
 use crate::crypto::{self, EccPrivate, EccPublicKey};
-use crate::handle::{ContextHandle, EntityHandle, HierarchyAuth, ObjectHandle, PcrOrNull};
+use crate::handle::{
+    ContextHandle, EntityHandle, HierarchyAuth, ObjectHandle, PcrOrNull, handle_type, ht,
+};
 use crate::hierarchy::{Hierarchy, NullSecrets, PersistentSecrets, Secrets};
 use crate::marshal::{List, Marshal, Tpm2b, Unmarshal};
 use crate::object::{self, Loaded, Object, Objects, SensitiveKind};
@@ -36,7 +38,8 @@ use crate::session::{
     SessionTable, SessionType,
 };
 use crate::types::{
-    CreationData, Data2b, EccPoint, Name2b, PublicKind, SensitiveCreate, SymDef, TkCreation,
+    CreationData, Data2b, Digest2b, EccPoint, Name2b, PublicKind, SensitiveCreate, SymDef,
+    TkCreation,
 };
 use crate::wire::{Blame as _, Buf, Reader, Writer};
 use crate::{Locality, Platform};
@@ -333,6 +336,35 @@ const MAX_ENCRYPTED_SECRET: usize = 256;
 
 /// `TPM_ST_CREATION`.
 const ST_CREATION: u16 = 0x8021;
+/// `TPM_ST_HASHCHECK`.
+const ST_HASHCHECK: u16 = 0x8024;
+/// `TPM_GENERATED_VALUE`, which starts every structure the TPM signs.
+const TPM_GENERATED_VALUE: u32 = 0xFF54_4347;
+/// `TPM_ALG_NULL`, a primary object's parent nameAlg.
+const NULL_ALG: u16 = crate::alg::id::NULL;
+/// `MAX_DIGEST_BUFFER`.
+const MAX_BUFFER: usize = 1024;
+
+/// What a new object's creation data is made from, beside the object and its parent.
+struct Creation {
+    outside: Data2b,
+    pcrs: List<Selection, 1>,
+    locality: Locality,
+}
+
+/// `TPMT_TK_HASHCHECK`.
+struct HashCheck {
+    hierarchy: u32,
+    digest: Vec<u8>,
+}
+
+impl Marshal for HashCheck {
+    fn write(&self, w: &mut Writer) {
+        w.u16(ST_HASHCHECK);
+        w.u32(self.hierarchy);
+        w.tpm2b(&self.digest);
+    }
+}
 
 impl Tpm<Running> {
     fn execute(
@@ -434,6 +466,7 @@ impl Tpm<Running> {
                     target,
                     &entity,
                     &mut self.lockout,
+                    self.stage.pcrs.counter(),
                 )?;
                 let params = auth.finish(&self.stage.reset.sessions, raw)?;
                 let mut r = Reader::new(&params);
@@ -461,6 +494,7 @@ impl Tpm<Running> {
                     hierarchy,
                     &entity,
                     &mut self.lockout,
+                    self.stage.pcrs.counter(),
                 )?;
                 let params = auth.finish(&self.stage.reset.sessions, raw)?;
                 let mut r = Reader::new(&params);
@@ -495,6 +529,7 @@ impl Tpm<Running> {
                     hierarchy,
                     &entity,
                     &mut self.lockout,
+                    self.stage.pcrs.counter(),
                 )?;
                 let params = auth.finish(&self.stage.reset.sessions, raw)?;
                 let mut r = Reader::new(&params);
@@ -583,6 +618,115 @@ impl Tpm<Running> {
                 r.finish().map_err(Rc::bare)?;
                 self.flush_context(target)?;
                 (None, Writer::new(), auth)
+            }
+            Cc::Create => {
+                let [h] = cmd.handles()?;
+                let parent = self.object_handle(h, false, 1)?.expect("a TPMI_DH_OBJECT");
+                let mut auth = self.read_auth(&mut cmd, vec![self.name_of_object(Some(parent))])?;
+                let raw = cmd.params();
+                let parent = self.authorize_object(&mut auth, raw, parent)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let mut r = Reader::new(&params);
+                let sensitive = Tpm2b::<SensitiveCreate>::read(&mut r).at(At::param(1))?.0;
+                let template = Tpm2b::<crate::types::Public>::read(&mut r).at(At::param(2))?.0;
+                let outside = Data2b::read(&mut r).at(At::param(3))?;
+                let creation_pcr = List::<Selection, 1>::read(&mut r).at(At::param(4))?;
+                r.finish().map_err(Rc::bare)?;
+                let out = self.create(
+                    platform,
+                    parent,
+                    sensitive,
+                    template,
+                    Creation { outside, pcrs: creation_pcr, locality },
+                )?;
+                (None, out, auth)
+            }
+            Cc::Load => {
+                let [h] = cmd.handles()?;
+                let parent = self.object_handle(h, false, 1)?.expect("a TPMI_DH_OBJECT");
+                let mut auth = self.read_auth(&mut cmd, vec![self.name_of_object(Some(parent))])?;
+                let raw = cmd.params();
+                let parent = self.authorize_object(&mut auth, raw, parent)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let mut r = Reader::new(&params);
+                let private = object::Private::read(&mut r).at(At::param(1))?;
+                let public = Tpm2b::<crate::types::Public>::read(&mut r).at(At::param(2))?.0;
+                r.finish().map_err(Rc::bare)?;
+                let (handle, out) = self.load(parent, private, public)?;
+                (Some(handle), out, auth)
+            }
+            Cc::Unseal => {
+                let [h] = cmd.handles()?;
+                let item = self.object_handle(h, false, 1)?.expect("a TPMI_DH_OBJECT");
+                let mut auth = self.read_auth(&mut cmd, vec![self.name_of_object(Some(item))])?;
+                let raw = cmd.params();
+                let item = self.authorize_object(&mut auth, raw, item)?.entity();
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                Reader::new(&params).finish().map_err(Rc::bare)?;
+                let o = self.stage.objects.get(item);
+                let SensitiveKind::KeyedHash(data) = &o.sensitive.kind else {
+                    return Err(Rc::Fmt1(Fmt1::Type, Some(At::handle(1))));
+                };
+                let a = o.public.attributes;
+                if a.decrypt() || a.sign_encrypt() || a.restricted() {
+                    return Err(Rc::Fmt1(Fmt1::Attributes, Some(At::handle(1))));
+                }
+                let mut out = Writer::new();
+                out.tpm2b(data.as_slice());
+                (None, out, auth)
+            }
+            Cc::PolicyPcr
+            | Cc::PolicyAuthValue
+            | Cc::PolicyPassword
+            | Cc::PolicyCommandCode
+            | Cc::PolicyRestart
+            | Cc::PolicyGetDigest => {
+                let [h] = cmd.handles()?;
+                let session = self.policy_session(h)?;
+                let mut auth = self.read_auth(&mut cmd, vec![handle_name(h)])?;
+                let raw = cmd.params();
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let out = self.policy(cc, session, &params)?;
+                (None, out, auth)
+            }
+            Cc::Hash => {
+                let mut auth = self.read_auth(&mut cmd, Vec::new())?;
+                let raw = cmd.params();
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let mut r = Reader::new(&params);
+                let data = Buf::<MAX_BUFFER>::read(&mut r).at(At::param(1))?;
+                let hash = Hash::read(&mut r).at(At::param(2))?;
+                let h = r.u32().at(At::param(3))?;
+                let hierarchy =
+                    Hierarchy::from_handle(h, true).ok_or(Fmt1::Value).at(At::param(3))?;
+                r.finish().map_err(Rc::bare)?;
+                let digest = hash.digest(&[data.as_slice()]);
+                let mut out = Writer::new();
+                out.tpm2b(digest.as_slice());
+                self.hash_check(hierarchy, hash, digest.as_slice(), data.as_slice())
+                    .write(&mut out);
+                (None, out, auth)
+            }
+            Cc::TestParms => {
+                let mut auth = self.read_auth(&mut cmd, Vec::new())?;
+                let raw = cmd.params();
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let mut r = Reader::new(&params);
+                // Everything TPM2_TestParms checks, unmarshalling checks.
+                crate::types::PublicParms::read(&mut r).at(At::param(1))?;
+                r.finish().map_err(Rc::bare)?;
+                (None, Writer::new(), auth)
+            }
+            Cc::EccParameters => {
+                let mut auth = self.read_auth(&mut cmd, Vec::new())?;
+                let raw = cmd.params();
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let mut r = Reader::new(&params);
+                let curve = crate::types::EccCurve::read(&mut r).at(At::param(1))?;
+                r.finish().map_err(Rc::bare)?;
+                let mut out = Writer::new();
+                crypto::ecc_parameters(curve, &mut out);
+                (None, out, auth)
             }
         };
         debug_assert_eq!(handle.is_some(), attributes.response_handle, "{cc:?}");
@@ -745,16 +889,44 @@ impl Tpm<Running> {
                     object::Unsupported::KeySize => Rc::Fmt1(Fmt1::KeySize, Some(At::param(1))),
                 })?;
         let name = object.name();
-        let (selection, pcr_digest) = self.stage.pcrs.digest(name_alg, creation_pcr.into_vec());
         let parent = handle_name(hierarchy.handle());
+        let mut out = Writer::new();
+        Tpm2b(&object.public).write(&mut out);
+        let creation = Creation { outside, pcrs: creation_pcr, locality };
+        self.write_creation(
+            &mut out,
+            creation,
+            hierarchy,
+            name_alg,
+            &name,
+            (NULL_ALG, &parent, &parent),
+        );
+        name.write(&mut out);
+        let loaded = self.stage.objects.insert(object).expect("a free slot was checked");
+        Ok((loaded.handle(), out))
+    }
+
+    /// `TPM2B_CREATION_DATA`, the creation hash and the creation ticket of a new object
+    /// (`FillInCreationData`, `TicketComputeCreation`), its parent given as its nameAlg, name
+    /// and qualified name.
+    fn write_creation(
+        &self,
+        out: &mut Writer,
+        c: Creation,
+        hierarchy: Hierarchy,
+        name_alg: Hash,
+        name: &Name2b,
+        (parent_name_alg, parent_name, parent_qualified_name): (u16, &Name2b, &Name2b),
+    ) {
+        let (selection, pcr_digest) = self.stage.pcrs.digest(name_alg, c.pcrs.into_vec());
         let creation = CreationData {
             pcr_select: List::new(selection).expect("at most one selection, as it came in"),
             pcr_digest: Buf::from_slice(pcr_digest.as_slice()).expect("a digest"),
-            locality: locality.bit(),
-            parent_name_alg: crate::alg::id::NULL,
-            parent_name: parent.clone(),
-            parent_qualified_name: parent,
-            outside_info: outside,
+            locality: c.locality.bit(),
+            parent_name_alg,
+            parent_name: parent_name.clone(),
+            parent_qualified_name: parent_qualified_name.clone(),
+            outside_info: c.outside,
         };
         let mut marshalled = Writer::new();
         creation.write(&mut marshalled);
@@ -771,14 +943,222 @@ impl Tpm<Running> {
                 Buf::from_slice(&d).expect("a SHA-256 HMAC")
             },
         };
-        let mut out = Writer::new();
-        Tpm2b(&object.public).write(&mut out);
-        Tpm2b(&creation).write(&mut out);
+        Tpm2b(&creation).write(out);
         out.tpm2b(creation_hash.as_slice());
-        ticket.write(&mut out);
-        name.write(&mut out);
+        ticket.write(out);
+    }
+
+    /// Checks the session for a loaded object's authorization, by its attributes: the
+    /// authValue may be used if userWithAuth is set, the policy if there is one, and failures
+    /// count toward lockout unless noDA is set.
+    fn authorize_object(
+        &mut self,
+        auth: &mut Authorization,
+        params: &[u8],
+        l: Loaded,
+    ) -> Result<Authorized<Loaded>, Rc> {
+        let o = self.stage.objects.get(l);
+        let a = o.public.attributes;
+        let name = o.name();
+        let value = AuthValue::from_slice(o.sensitive.auth.as_slice());
+        let entity = EntityAuth {
+            name: name.as_slice(),
+            value: &value,
+            policy: o.public.auth_policy.as_slice(),
+            da: if a.no_da() { Da::Exempt } else { Da::Protected },
+            value_available: a.user_with_auth(),
+        };
+        auth.authorize(
+            &self.stage.reset.sessions,
+            params,
+            l,
+            &entity,
+            &mut self.lockout,
+            self.stage.pcrs.counter(),
+        )
+    }
+
+    fn create(
+        &mut self,
+        platform: &mut impl Platform,
+        parent: Authorized<Loaded>,
+        sensitive: SensitiveCreate,
+        template: crate::types::Public,
+        creation: Creation,
+    ) -> Result<Writer, Rc> {
+        let p = self.stage.objects.get(parent.entity());
+        if !object::is_parent(p) {
+            return Err(Rc::Fmt1(Fmt1::Type, Some(At::handle(1))));
+        }
+        if self.stage.objects.loaded_count() == object::MAX_LOADED_OBJECTS {
+            return Err(Warn::ObjectMemory.into());
+        }
+        object::validate_template(&template, sensitive.data.as_slice().len(), Some(p))
+            .at(At::param(2))?;
+        let name_alg = template.name_alg;
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        platform.fill_random(&mut seed[..]);
+        let mut drbg = crypto::Drbg::new(&seed[..], b"Object Creation", &[]);
+        let child = object::create(p, template, sensitive, &mut drbg).map_err(|e| match e {
+            object::Unsupported::Rsa => Rc::Fmt1(Fmt1::Type, Some(At::param(2))),
+            object::Unsupported::KeySize => Rc::Fmt1(Fmt1::KeySize, Some(At::param(1))),
+        })?;
+        let mut iv = [0u8; 16];
+        platform.fill_random(&mut iv);
+        let name = child.name();
+        let mut out = Writer::new();
+        object::wrap(p, &child, iv).write(&mut out);
+        Tpm2b(&child.public).write(&mut out);
+        let parent_name = p.name();
+        self.write_creation(
+            &mut out,
+            creation,
+            p.hierarchy,
+            name_alg,
+            &name,
+            (p.public.name_alg.id(), &parent_name, &p.qualified_name),
+        );
+        Ok(out)
+    }
+
+    fn load(
+        &mut self,
+        parent: Authorized<Loaded>,
+        private: object::Private,
+        public: crate::types::Public,
+    ) -> Result<(u32, Writer), Rc> {
+        if self.stage.objects.loaded_count() == object::MAX_LOADED_OBJECTS {
+            return Err(Warn::ObjectMemory.into());
+        }
+        if private.as_slice().is_empty() {
+            return Err(Rc::Fmt1(Fmt1::Size, Some(At::param(1))));
+        }
+        let p = self.stage.objects.get(parent.entity());
+        if !object::is_parent(p) {
+            return Err(Rc::Fmt1(Fmt1::Type, Some(At::handle(1))));
+        }
+        let name = public.name();
+        let sensitive = object::unwrap(p, &name, private.as_slice(), At::param(1))?;
+        let object = object::load(p, public, sensitive, At::param(1), At::param(2))?;
         let loaded = self.stage.objects.insert(object).expect("a free slot was checked");
+        let mut out = Writer::new();
+        name.write(&mut out);
         Ok((loaded.handle(), out))
+    }
+
+    /// A `TPMI_SH_POLICY` handle: `TPM_RC_VALUE` for another handle type,
+    /// `TPM_RC_REFERENCE_H0` for a policy session that is not loaded.
+    fn policy_session(&self, h: u32) -> Result<u32, Rc> {
+        if handle_type(h) != ht::POLICY_SESSION {
+            return Err(Rc::Fmt1(Fmt1::Value, Some(At::handle(1))));
+        }
+        match self.stage.reset.sessions.get(h) {
+            Some(Session::Policy(_)) => Ok(h),
+            _ => Err(Warn::ReferenceH(Slot::new(0).expect("slot 0")).into()),
+        }
+    }
+
+    /// The policy commands, each of which updates the policy session's digest and state.
+    fn policy(&mut self, cc: Cc, h: u32, params: &[u8]) -> Result<Writer, Rc> {
+        let counter = self.stage.pcrs.counter();
+        let mut r = Reader::new(params);
+        let mut out = Writer::new();
+        let code = cc.code().to_be_bytes();
+        match cc {
+            Cc::PolicyPcr => {
+                let expected = Digest2b::read(&mut r).at(At::param(1))?;
+                let pcrs = List::<Selection, 1>::read(&mut r).at(At::param(2))?;
+                r.finish().map_err(Rc::bare)?;
+                let hash = self.policy_mut(h).core.auth_hash;
+                let (selection, current) = self.stage.pcrs.digest(hash, pcrs.into_vec());
+                let p = self.policy_mut(h);
+                let digest = if p.trial {
+                    if expected.as_slice().is_empty() {
+                        current.as_slice()
+                    } else {
+                        expected.as_slice()
+                    }
+                    .to_vec()
+                } else {
+                    if p.pcr_counter.is_some_and(|c| c != counter) {
+                        return Err(Fmt0::PcrChanged.into());
+                    }
+                    if !expected.as_slice().is_empty() && expected.as_slice() != current.as_slice()
+                    {
+                        return Err(Rc::Fmt1(Fmt1::Value, Some(At::param(1))));
+                    }
+                    current.as_slice().to_vec()
+                };
+                let mut marshalled = Writer::new();
+                List::<Selection, 1>::new(selection)
+                    .expect("at most one selection, as it came in")
+                    .write(&mut marshalled);
+                p.extend(&[&code, &marshalled.into_vec(), &digest]);
+                if !p.trial {
+                    p.pcr_counter = Some(counter);
+                }
+            }
+            Cc::PolicyAuthValue | Cc::PolicyPassword => {
+                r.finish().map_err(Rc::bare)?;
+                let p = self.policy_mut(h);
+                // Both record TPM_CC_PolicyAuthValue: the two policies are the same policy,
+                // differing only in how the authValue is presented.
+                p.extend(&[&Cc::PolicyAuthValue.code().to_be_bytes()]);
+                p.auth_value_needed = cc == Cc::PolicyAuthValue;
+                p.password_needed = cc == Cc::PolicyPassword;
+            }
+            Cc::PolicyCommandCode => {
+                let target = r.u32().at(At::param(1))?;
+                r.finish().map_err(Rc::bare)?;
+                let p = self.policy_mut(h);
+                if p.command_code.is_some_and(|c| c != target) {
+                    return Err(Rc::Fmt1(Fmt1::Value, Some(At::param(1))));
+                }
+                if Cc::from_code(target).is_none() {
+                    return Err(Rc::Fmt1(Fmt1::PolicyCc, Some(At::param(1))));
+                }
+                p.extend(&[&code, &target.to_be_bytes()]);
+                p.command_code = Some(target);
+            }
+            Cc::PolicyRestart => {
+                r.finish().map_err(Rc::bare)?;
+                self.policy_mut(h).restart();
+            }
+            Cc::PolicyGetDigest => {
+                r.finish().map_err(Rc::bare)?;
+                out.tpm2b(&self.policy_mut(h).digest);
+            }
+            _ => unreachable!("{cc:?} is not a policy command"),
+        }
+        Ok(out)
+    }
+
+    fn policy_mut(&mut self, h: u32) -> &mut session::PolicySession {
+        match self.stage.reset.sessions.get_mut(h) {
+            Some(Session::Policy(p)) => p,
+            _ => unreachable!("policy_session() checked {h:#x}"),
+        }
+    }
+
+    /// `TPMT_TK_HASHCHECK` for a digest of `data` (`TicketComputeHashCheck`): a NULL ticket under
+    /// the NULL hierarchy, or when the data could be passed off as something the TPM produced
+    /// (it starts with `TPM_GENERATED_VALUE`).
+    fn hash_check(
+        &self,
+        hierarchy: Hierarchy,
+        hash: Hash,
+        digest: &[u8],
+        data: &[u8],
+    ) -> HashCheck {
+        if hierarchy == Hierarchy::Null || data.starts_with(&TPM_GENERATED_VALUE.to_be_bytes()) {
+            return HashCheck { hierarchy: crate::handle::rh::NULL, digest: Vec::new() };
+        }
+        let d = crypto::hmac(
+            Hash::Sha256,
+            self.secrets().proof(hierarchy),
+            &[&ST_HASHCHECK.to_be_bytes(), &hash.id().to_be_bytes(), digest],
+        );
+        HashCheck { hierarchy: hierarchy.handle(), digest: d.to_vec() }
     }
 
     fn start_auth_session(

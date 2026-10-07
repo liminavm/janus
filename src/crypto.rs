@@ -238,8 +238,10 @@ const SMALL_PRIMES: [u32; 53] = [
     197, 199, 211, 223, 227, 229, 233, 239, 241, 251,
 ];
 
+/// `n mod m`, `n` big-endian. In 64 bits, since `m` may be an exponent close to 2^32.
 fn rem_small(n: &[u8], m: u32) -> u32 {
-    n.iter().fold(0, |r, b| (r * 256 + u32::from(*b)) % m)
+    let m = u64::from(m);
+    n.iter().fold(0, |r, b| (r * 256 + u64::from(*b)) % m) as u32
 }
 
 /// An RSA-2048 private key.
@@ -505,6 +507,17 @@ mod tests {
         for e in [3, 17, 65535, 65541, 0xFFFF_FFFF] {
             assert_eq!(rsa_exponent(e), None, "{e}");
         }
+    }
+
+    /// The candidate test divides by the exponent too, which may be any prime up to
+    /// 2^32 - 5: a remainder times 256 must not overflow.
+    #[test]
+    fn a_candidates_remainder_is_exact_for_the_largest_exponent() {
+        let e = 0xFFFF_FFFB;
+        assert_eq!(rsa_exponent(e), Some(e));
+        let n = [0xFFu8; 128];
+        let expected = n.iter().fold(0u128, |r, b| (r * 256 + u128::from(*b)) % u128::from(e));
+        assert_eq!(u128::from(rem_small(&n, e)), expected);
     }
 
     fn hex(s: &str) -> Vec<u8> {

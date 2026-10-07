@@ -160,7 +160,6 @@ const ALGS: &[(u16, u32)] = &[
     (crate::alg::id::AES, 0x2),
     (crate::alg::id::KEYEDHASH, 0x30C),
     (crate::alg::id::SHA256, 0x4),
-    (crate::alg::id::NULL, 0x0),
     (crate::alg::id::RSASSA, 0x101),
     (crate::alg::id::RSAES, 0x201),
     (crate::alg::id::RSAPSS, 0x101),

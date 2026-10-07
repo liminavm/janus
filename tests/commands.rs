@@ -622,7 +622,8 @@ fn the_clock_runs_while_the_tpm_does_and_time_since_init() {
 }
 
 /// `TPM_CAP_ALGS` lists every algorithm a client may name in a command janus implements, with
-/// the `TPMA_ALGORITHM` swtpm reports for it (the corpus's GetCapability answers).
+/// the `TPMA_ALGORITHM` swtpm reports for it (the corpus's GetCapability answers); like the
+/// reference, not `TPM_ALG_NULL`.
 #[test]
 fn the_algorithm_list_is_every_algorithm_janus_implements() {
     let mut tpm = started();
@@ -640,7 +641,6 @@ fn the_algorithm_list_is_every_algorithm_janus_implements() {
         (0x0006, 0x002), // AES
         (0x0008, 0x30C), // KEYEDHASH
         (0x000B, 0x004), // SHA256
-        (0x0010, 0x000), // NULL
         (0x0014, 0x101), // RSASSA
         (0x0015, 0x201), // RSAES
         (0x0016, 0x101), // RSAPSS

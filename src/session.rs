@@ -392,10 +392,130 @@ impl<E: Copy> Authorized<E> {
     }
 }
 
-/// The dictionary-attack state the authorization check reads and updates.
+/// The dictionary-attack state the authorization check reads and updates (the reference's
+/// `DA.c`). The counters and parameters survive `_TPM_Init`, as the reference keeps them in NV;
+/// the two timers restart at every Startup.
 pub struct Lockout {
-    /// The lockout hierarchy's own authorization failed, which disables it until recovery.
-    pub lockout_auth_failed: bool,
+    /// Failed authorizations of protected entities not yet healed (`failedTries`).
+    failed_tries: u32,
+    /// The failures at which protected entities lock out (`maxTries`).
+    max_tries: u32,
+    /// Seconds per healed failure (`recoveryTime`); 0 turns the counter off.
+    recovery_time: u32,
+    /// Seconds after a failed lockout authorization before it may be tried again
+    /// (`lockoutRecovery`); 0 means only at the next Startup.
+    lockout_recovery: u32,
+    /// The lockout hierarchy's authorization may be used (`lockOutAuthEnabled`).
+    lockout_auth_enabled: bool,
+    /// `Time`, in milliseconds since `_TPM_Init`, as of the command being executed.
+    now: u64,
+    /// When the healing of `failed_tries` last advanced or a failure restarted it.
+    self_heal_timer: u64,
+    /// When the lockout hierarchy's authorization last failed.
+    lockout_timer: u64,
+}
+
+impl Lockout {
+    /// The values a new TPM is manufactured with (`DAPreInstall_Init`).
+    pub fn manufactured() -> Lockout {
+        Lockout {
+            failed_tries: 0,
+            max_tries: 3,
+            recovery_time: 1000,
+            lockout_recovery: 1000,
+            lockout_auth_enabled: true,
+            now: 0,
+            self_heal_timer: 0,
+            lockout_timer: 0,
+        }
+    }
+
+    /// `DAStartup`, in the reference's build without `USE_DA_USED` or an accumulating
+    /// self-heal timer (the guests' TPM, libtpms, never answers the first protected
+    /// authorization after a Startup with `TPM_RC_RETRY`): the timers restart; a lockout that
+    /// recovers only at Startup recovers; and a Startup after no orderly shutdown counts as a
+    /// failure, since one may have gone unrecorded.
+    pub fn startup(&mut self, orderly: bool) {
+        self.now = 0;
+        self.self_heal_timer = 0;
+        self.lockout_timer = 0;
+        if self.lockout_recovery == 0 {
+            self.lockout_auth_enabled = true;
+        }
+        if self.recovery_time != 0 && self.failed_tries < self.max_tries && !orderly {
+            self.failed_tries += 1;
+        }
+    }
+
+    /// `DASelfHeal` at `time`, `Time` in milliseconds: one failure heals per `recovery_time`
+    /// seconds since the timer, and the lockout hierarchy recovers `lockout_recovery` seconds
+    /// after its last failure.
+    pub fn self_heal(&mut self, time: u64) {
+        self.now = time;
+        if self.failed_tries != 0 {
+            if self.recovery_time == 0 {
+                self.failed_tries = 0;
+            } else {
+                let healed = time.saturating_sub(self.self_heal_timer)
+                    / 1000
+                    / u64::from(self.recovery_time);
+                self.failed_tries =
+                    self.failed_tries.saturating_sub(u32::try_from(healed).unwrap_or(u32::MAX));
+                self.self_heal_timer = self
+                    .self_heal_timer
+                    .saturating_add(healed.saturating_mul(u64::from(self.recovery_time)) * 1000);
+            }
+        }
+        if !self.lockout_auth_enabled
+            && self.lockout_recovery != 0
+            && time.saturating_sub(self.lockout_timer) / 1000 >= u64::from(self.lockout_recovery)
+        {
+            self.lockout_auth_enabled = true;
+        }
+    }
+
+    /// `CheckLockedOut`: the lockout hierarchy (`lockout_auth`) while its use is disabled, any
+    /// other protected entity while the failures reach the limit.
+    fn locked_out(&self, lockout_auth: bool) -> bool {
+        if lockout_auth { !self.lockout_auth_enabled } else { self.failed_tries >= self.max_tries }
+    }
+
+    /// The failures have reached the limit (`TPMA_PERMANENT.inLockout`).
+    pub fn in_lockout(&self) -> bool {
+        self.locked_out(false)
+    }
+
+    /// The counter of `IncrementLockout` and `DARegisterFailure`: a failed lockout
+    /// authorization disables it, any other counts a failure; either restarts its timer.
+    fn register_failure(&mut self, lockout_auth: bool) {
+        if lockout_auth {
+            self.lockout_auth_enabled = false;
+            self.lockout_timer = self.now;
+        } else {
+            if self.recovery_time != 0 {
+                self.failed_tries = self.failed_tries.saturating_add(1);
+            }
+            self.self_heal_timer = self.now;
+        }
+    }
+
+    /// `TPM2_DictionaryAttackLockReset`.
+    pub fn reset(&mut self) {
+        self.failed_tries = 0;
+    }
+
+    /// `TPM2_DictionaryAttackParameters`.
+    pub fn set_parameters(&mut self, max_tries: u32, recovery_time: u32, lockout_recovery: u32) {
+        self.max_tries = max_tries;
+        self.recovery_time = recovery_time;
+        self.lockout_recovery = lockout_recovery;
+    }
+
+    /// `TPM_PT_LOCKOUT_COUNTER`, `TPM_PT_MAX_AUTH_FAIL`, `TPM_PT_LOCKOUT_INTERVAL` and
+    /// `TPM_PT_LOCKOUT_RECOVERY`.
+    pub fn properties(&self) -> [u32; 4] {
+        [self.failed_tries, self.max_tries, self.recovery_time, self.lockout_recovery]
+    }
 }
 
 /// Which session a command's authorization area names.
@@ -639,17 +759,11 @@ impl Authorization {
         assert!(i < self.auth_handles, "authorize() called for more handles than the command has");
         self.checked += 1;
         let at = at_session(i);
-        let fail = |lockout: &mut Lockout| -> Rc {
-            match auth.da {
-                Da::Exempt => Rc::Fmt1(Fmt1::BadAuth, Some(at)),
-                Da::Lockout => {
-                    lockout.lockout_auth_failed = true;
-                    Rc::Fmt1(Fmt1::AuthFail, Some(at))
-                }
-                Da::Protected => Rc::Fmt1(Fmt1::AuthFail, Some(at)),
-            }
+        let locked_out = |lockout: &Lockout| match auth.da {
+            Da::Exempt => false,
+            Da::Protected => lockout.locked_out(false),
+            Da::Lockout => lockout.locked_out(true),
         };
-        let locked_out = |lockout: &Lockout| auth.da == Da::Lockout && lockout.lockout_auth_failed;
         match self.entries[i].session {
             SessionRef::Password => {
                 if locked_out(lockout) {
@@ -663,16 +777,33 @@ impl Authorization {
                     self.entries[i].auth_value = Zeroizing::new(auth.value.key_material().to_vec());
                     return Ok(Authorized { entity });
                 }
-                Err(fail(lockout))
+                // IncrementLockout for a password: only the entity's own protection counts.
+                if auth.da == Da::Exempt {
+                    return Err(Rc::Fmt1(Fmt1::BadAuth, Some(at)));
+                }
+                lockout.register_failure(auth.da == Da::Lockout);
+                Err(Rc::Fmt1(Fmt1::AuthFail, Some(at)))
             }
             SessionRef::Loaded(h) => {
                 let session = sessions.get(h).expect("read() found it");
-                if session.core().da_bound
-                    && session.core().lockout_bound
-                    && lockout.lockout_auth_failed
-                {
+                let core = session.core();
+                // A session bound to a protected entity is refused while that entity's kind is
+                // locked out, whatever it authorizes now (`ExecCommand`'s session loop).
+                if core.da_bound && lockout.locked_out(core.lockout_bound) {
                     return Err(Warn::Lockout.into());
                 }
+                // IncrementLockout for a session: one bound to lockout counts as lockout; one
+                // bound to no protected entity counts only if the authValue was in the HMAC of
+                // a protected entity.
+                let (da_bound, lockout_bound) = (core.da_bound, core.lockout_bound);
+                let fail = |lockout: &mut Lockout, include_auth: bool| -> Rc {
+                    let exempt = !lockout_bound && auth.da == Da::Exempt;
+                    if !da_bound && (exempt || !include_auth) {
+                        return Rc::Fmt1(Fmt1::BadAuth, Some(at));
+                    }
+                    lockout.register_failure(lockout_bound || auth.da == Da::Lockout);
+                    Rc::Fmt1(Fmt1::AuthFail, Some(at))
+                };
                 self.entries[i].auth_value = Zeroizing::new(auth.value.key_material().to_vec());
                 match session {
                     Session::Hmac(s) => {
@@ -687,7 +818,7 @@ impl Authorization {
                         if self.check_hmac(i, sessions, params) {
                             Ok(Authorized { entity })
                         } else {
-                            Err(fail(lockout))
+                            Err(fail(lockout, !bound))
                         }
                     }
                     Session::Policy(p) => {
@@ -713,13 +844,14 @@ impl Authorization {
                             return if auth.value.matches(&presented) {
                                 Ok(Authorized { entity })
                             } else {
-                                Err(fail(lockout))
+                                Err(fail(lockout, true))
                             };
                         }
+                        let include_auth = self.entries[i].include_auth;
                         if self.check_hmac(i, sessions, params) {
                             Ok(Authorized { entity })
                         } else {
-                            Err(fail(lockout))
+                            Err(fail(lockout, include_auth))
                         }
                     }
                 }
@@ -729,22 +861,34 @@ impl Authorization {
 
     /// After every handle is authorized: checks the sessions that authorize nothing, then
     /// decrypts the first parameter if a session asked for it. Returns the parameters to parse.
-    pub fn finish(&mut self, sessions: &SessionTable, params: &[u8]) -> Result<Vec<u8>, Rc> {
+    ///
+    /// Such a session bound to a protected entity is refused while that entity's kind is
+    /// locked out, and its failed HMAC counts as a failure of that kind; one bound to nothing
+    /// protected fails with `TPM_RC_BAD_AUTH` and counts nothing.
+    pub fn finish(
+        &mut self,
+        sessions: &SessionTable,
+        params: &[u8],
+        lockout: &mut Lockout,
+    ) -> Result<Vec<u8>, Rc> {
         assert_eq!(self.checked, self.auth_handles, "a handle's session was never checked");
         for i in self.auth_handles..self.entries.len() {
             let at = at_session(i);
             let e = &self.entries[i];
+            let SessionRef::Loaded(h) = e.session else { unreachable!("read() refused it") };
+            let core = sessions.get(h).expect("read() found it").core();
+            if core.da_bound && lockout.locked_out(core.lockout_bound) {
+                return Err(Warn::Lockout.into());
+            }
             if !e.attributes.encrypt() && !e.attributes.decrypt() && !e.attributes.audit() {
                 return Err(Rc::Fmt1(Fmt1::Attributes, Some(at)));
             }
             if !self.check_hmac(i, sessions, params) {
-                let SessionRef::Loaded(h) = e.session else { unreachable!() };
-                let core = sessions.get(h).expect("read() found it").core();
-                return Err(if core.da_bound {
-                    Rc::Fmt1(Fmt1::AuthFail, Some(at))
-                } else {
-                    Rc::Fmt1(Fmt1::BadAuth, Some(at))
-                });
+                if !core.da_bound {
+                    return Err(Rc::Fmt1(Fmt1::BadAuth, Some(at)));
+                }
+                lockout.register_failure(core.lockout_bound);
+                return Err(Rc::Fmt1(Fmt1::AuthFail, Some(at)));
             }
         }
         let mut params = params.to_vec();

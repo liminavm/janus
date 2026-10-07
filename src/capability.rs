@@ -49,6 +49,10 @@ pub struct Variable {
     pub owner_auth_set: bool,
     pub endorsement_auth_set: bool,
     pub lockout_auth_set: bool,
+    /// `TPMA_PERMANENT.inLockout`.
+    pub in_lockout: bool,
+    /// `TPM_PT_LOCKOUT_COUNTER` through `TPM_PT_LOCKOUT_RECOVERY`.
+    pub lockout: [u32; 4],
     pub orderly: bool,
     /// Loaded transient objects' handles, in order.
     pub transient: Vec<u32>,
@@ -120,7 +124,8 @@ const FIXED: &[(u32, u32)] = &[
 fn variable(v: &Variable) -> Vec<(u32, u32)> {
     let permanent = (v.owner_auth_set as u32)
         | ((v.endorsement_auth_set as u32) << 1)
-        | ((v.lockout_auth_set as u32) << 2);
+        | ((v.lockout_auth_set as u32) << 2)
+        | ((v.in_lockout as u32) << 9);
     // phEnable, shEnable, ehEnable, phEnableNV: no command can clear them yet.
     let startup_clear = 0xF | ((v.orderly as u32) << 31);
     let loaded = v.loaded_sessions.len() as u32;
@@ -142,6 +147,10 @@ fn variable(v: &Variable) -> Vec<(u32, u32)> {
         (0x20B, 0),                                          // NV_COUNTERS_AVAIL
         (0x20C, 0),                                          // ALGORITHM_SET
         (0x20D, 0),                                          // LOADED_CURVES
+        (0x20E, v.lockout[0]),                               // LOCKOUT_COUNTER
+        (0x20F, v.lockout[1]),                               // MAX_AUTH_FAIL
+        (0x210, v.lockout[2]),                               // LOCKOUT_INTERVAL
+        (0x211, v.lockout[3]),                               // LOCKOUT_RECOVERY
     ]
 }
 

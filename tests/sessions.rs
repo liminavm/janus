@@ -474,6 +474,47 @@ fn a_session_that_authorizes_nothing_must_encrypt_or_decrypt() {
     assert_eq!(rc(&rsp), 0x982);
 }
 
+/// `TPM_PT_LOCKOUT_COUNTER`.
+fn lockout_counter(tpm: &mut Janus<Recorder>) -> u32 {
+    let params = [6u32.to_be_bytes(), 0x20Eu32.to_be_bytes(), 1u32.to_be_bytes()].concat();
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x17A, &[], None, &params));
+    assert_eq!(rc(&rsp), 0);
+    assert_eq!(u32_at(&rsp, 19), 0x20E);
+    u32_at(&rsp, 23)
+}
+
+/// A session bound to an entity subject to dictionary-attack protection carries it: its
+/// failed HMAC counts a failure even where it authorizes nothing (`IncrementLockout`), and it is
+/// refused while that protection is locked out (`ExecCommand`'s session loop).
+#[test]
+fn a_session_bound_to_a_protected_key_counts_its_failures_and_locks_out() {
+    let (mut tpm, _) = started();
+    // An unrestricted ECC key without noDA, under an empty authValue.
+    let (protected, _) = primary(&mut tpm, RH_OWNER, ECC_KEY_TEMPLATE);
+    let (key, x, y) = kernel_primary(&mut tpm);
+    let s = start_salted(&mut tpm, (key, &x, &y), protected, &[]);
+    let params = 16u16.to_be_bytes();
+    let cp = sha256(&[&0x17Bu32.to_be_bytes(), &params]);
+    for n in 1..=3 {
+        let mut area = s.entry(&cp, CONTINUE | ENCRYPT, &[]);
+        let last = area.len() - 1;
+        area[last] ^= 1;
+        let rsp = tpm.execute(Locality::ZERO, &command(0x8002, 0x17B, &[], Some(&area), &params));
+        // TPM_RC_AUTH_FAIL on session 1, counted.
+        assert_eq!(rc(&rsp), 0x98E, "failure {n}");
+        assert_eq!(lockout_counter(&mut tpm), n);
+    }
+    // At maxTries the session is refused before its HMAC is looked at.
+    let area = s.entry(&cp, CONTINUE | ENCRYPT, &[]);
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8002, 0x17B, &[], Some(&area), &params));
+    assert_eq!(rc(&rsp), 0x921);
+    // An unbound session is not.
+    let free = start_salted(&mut tpm, (key, &x, &y), RH_NULL, &[]);
+    let area = free.entry(&cp, CONTINUE | ENCRYPT, &[]);
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8002, 0x17B, &[], Some(&area), &params));
+    assert_eq!(rc(&rsp), 0);
+}
+
 const TPM_SE_POLICY: u8 = 0x01;
 const TPM_SE_TRIAL: u8 = 0x03;
 const NO_SYMMETRIC: [u8; 2] = [0x00, 0x10];

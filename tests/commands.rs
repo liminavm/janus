@@ -653,3 +653,198 @@ fn the_algorithm_list_is_every_algorithm_janus_implements() {
     ];
     assert_eq!(listed, expected);
 }
+
+/// Runs `c` on any platform and returns its response code.
+fn exec<P: Platform>(tpm: &mut Janus<P>, c: &[u8]) -> u32 {
+    rc(&tpm.execute(Locality::ZERO, c))
+}
+
+/// An NV index at `index` with the password `pin`, readable and writable under it or the
+/// owner's, 8 bytes, protected from dictionary attacks unless `no_da`.
+fn nv_define_pin(index: u32, pin: &[u8], no_da: bool) -> Vec<u8> {
+    let attributes = 0x0006_0006u32 | if no_da { 1 << 25 } else { 0 };
+    let public = [
+        &index.to_be_bytes()[..],
+        &0x000Bu16.to_be_bytes(),
+        &attributes.to_be_bytes(),
+        &tpm2b(&[]),
+        &8u16.to_be_bytes(),
+    ]
+    .concat();
+    let mut body = OWNER.to_be_bytes().to_vec();
+    body.extend(area(&[password(b"")]));
+    body.extend(tpm2b(pin));
+    body.extend(tpm2b(&public));
+    cmd(SESSIONS, 0x12A, &body)
+}
+
+/// TPM2_NV_Read of 8 bytes by `by` with `pw`. The index is never written, so an accepted
+/// authorization answers TPM_RC_NV_UNINITIALIZED (0x14A).
+fn nv_read_with(by: u32, index: u32, pw: &[u8]) -> Vec<u8> {
+    let mut body = by.to_be_bytes().to_vec();
+    body.extend_from_slice(&index.to_be_bytes());
+    body.extend(area(&[password(pw)]));
+    body.extend_from_slice(&8u16.to_be_bytes());
+    body.extend_from_slice(&0u16.to_be_bytes());
+    cmd(SESSIONS, 0x14E, &body)
+}
+
+fn lock_reset(pw: &[u8]) -> Vec<u8> {
+    let mut body = LOCKOUT.to_be_bytes().to_vec();
+    body.extend(area(&[password(pw)]));
+    cmd(SESSIONS, 0x139, &body)
+}
+
+fn da_parameters(handle: u32, pw: &[u8], max: u32, recovery: u32, lockout: u32) -> Vec<u8> {
+    let mut body = handle.to_be_bytes().to_vec();
+    body.extend(area(&[password(pw)]));
+    for v in [max, recovery, lockout] {
+        body.extend_from_slice(&v.to_be_bytes());
+    }
+    cmd(SESSIONS, 0x13A, &body)
+}
+
+/// TPM_PT_LOCKOUT_COUNTER through TPM_PT_LOCKOUT_RECOVERY, and TPMA_PERMANENT.inLockout.
+fn da_state<P: Platform>(tpm: &mut Janus<P>) -> ([u32; 4], bool) {
+    let rsp = tpm.execute(Locality::ZERO, &cmd(NO_SESSIONS, 0x17A, &get_capability(6, 0x20E, 4)));
+    assert_eq!(rc(&rsp), 0);
+    let u32_at = |i: usize| u32::from_be_bytes(rsp[i..i + 4].try_into().unwrap());
+    assert_eq!(u32_at(15), 4);
+    let mut values = [0; 4];
+    for (k, v) in values.iter_mut().enumerate() {
+        assert_eq!(u32_at(19 + 8 * k), 0x20E + k as u32);
+        *v = u32_at(23 + 8 * k);
+    }
+    let rsp = tpm.execute(Locality::ZERO, &cmd(NO_SESSIONS, 0x17A, &get_capability(6, 0x200, 1)));
+    let permanent = u32::from_be_bytes(rsp[23..27].try_into().unwrap());
+    (values, permanent & 1 << 9 != 0)
+}
+
+fn clocked_started(at: u64) -> (Janus<Clocked>, std::rc::Rc<std::cell::Cell<u64>>) {
+    let now = std::rc::Rc::new(std::cell::Cell::new(at));
+    let mut tpm = Janus::manufacture(Clocked(now.clone()));
+    tpm.init();
+    assert_eq!(exec(&mut tpm, &startup(false)), 0);
+    (tpm, now)
+}
+
+/// A protected entity's wrong password counts a failure (`IncrementLockout`); at `maxTries` (3)
+/// every protected entity is locked out (`CheckLockedOut`), even with the right password, while
+/// exempt ones are not; one failure heals per `recoveryTime` (1000 s) of `Time`
+/// (`DASelfHeal`), and DictionaryAttackLockReset heals them all.
+#[test]
+fn protected_entities_lock_out_after_three_failures_and_heal_with_time() {
+    let (mut tpm, now) = clocked_started(0);
+    let index = 0x0150_0000;
+    assert_eq!(exec(&mut tpm, &nv_define_pin(index, b"pin", false)), 0);
+    let exempt = 0x0150_0001;
+    assert_eq!(exec(&mut tpm, &nv_define_pin(exempt, b"pin", true)), 0);
+    // A manufactured TPM starts orderly: nothing counted, the reference's defaults.
+    assert_eq!(da_state(&mut tpm), ([0, 3, 1000, 1000], false));
+    assert_eq!(exec(&mut tpm, &nv_read_with(index, index, b"pin")), 0x14A);
+    // A noDA index's wrong password is TPM_RC_BAD_AUTH and counts nothing.
+    assert_eq!(exec(&mut tpm, &nv_read_with(exempt, exempt, b"no")), 0x9A2);
+    for n in 1..=3 {
+        assert_eq!(exec(&mut tpm, &nv_read_with(index, index, b"no")), 0x98E, "failure {n}");
+        assert_eq!(da_state(&mut tpm).0[0], n);
+    }
+    assert_eq!(da_state(&mut tpm), ([3, 3, 1000, 1000], true));
+    // Locked out: TPM_RC_LOCKOUT before the password is even compared.
+    assert_eq!(exec(&mut tpm, &nv_read_with(index, index, b"pin")), 0x921);
+    assert_eq!(exec(&mut tpm, &nv_read_with(index, index, b"no")), 0x921);
+    assert_eq!(da_state(&mut tpm).0[0], 3, "a refusal in lockout counts nothing");
+    // The owner's authorization and a noDA index's are exempt.
+    assert_eq!(exec(&mut tpm, &nv_read_with(OWNER, index, b"")), 0x14A);
+    assert_eq!(exec(&mut tpm, &nv_read_with(exempt, exempt, b"pin")), 0x14A);
+    // Time heals one failure per 1000 s since the last failure.
+    now.set(999_999);
+    assert_eq!(exec(&mut tpm, &nv_read_with(index, index, b"pin")), 0x921);
+    now.set(1_000_000);
+    assert_eq!(exec(&mut tpm, &nv_read_with(index, index, b"pin")), 0x14A);
+    assert_eq!(da_state(&mut tpm), ([2, 3, 1000, 1000], false));
+    now.set(2_500_000);
+    assert_eq!(da_state(&mut tpm).0[0], 1);
+    // DictionaryAttackLockReset under the lockout hierarchy clears the rest.
+    assert_eq!(exec(&mut tpm, &lock_reset(b"")), 0);
+    assert_eq!(da_state(&mut tpm).0[0], 0);
+    // A failure restarts the healing: it heals 1000 s after itself, not after the last heal.
+    assert_eq!(exec(&mut tpm, &nv_read_with(index, index, b"no")), 0x98E);
+    now.set(3_499_999);
+    assert_eq!(da_state(&mut tpm).0[0], 1);
+    now.set(3_500_000);
+    assert_eq!(da_state(&mut tpm).0[0], 0);
+}
+
+/// A failed lockout authorization disables it (`lockOutAuthEnabled`) until `lockoutRecovery`
+/// (1000 s) has passed; with `lockoutRecovery` 0, until the next Startup.
+#[test]
+fn a_failed_lockout_authorization_recovers_after_lockout_recovery() {
+    let (mut tpm, now) = clocked_started(0);
+    assert_eq!(exec(&mut tpm, &lock_reset(b"wrong")), 0x98E);
+    assert_eq!(exec(&mut tpm, &lock_reset(b"")), 0x921);
+    // It counts nothing toward the protected entities' limit.
+    assert_eq!(da_state(&mut tpm), ([0, 3, 1000, 1000], false));
+    now.set(999_999);
+    assert_eq!(exec(&mut tpm, &lock_reset(b"")), 0x921);
+    now.set(1_000_000);
+    assert_eq!(exec(&mut tpm, &lock_reset(b"")), 0);
+
+    assert_eq!(exec(&mut tpm, &da_parameters(LOCKOUT, b"", 3, 1000, 0)), 0);
+    assert_eq!(exec(&mut tpm, &lock_reset(b"wrong")), 0x98E);
+    now.set(100_000_000);
+    assert_eq!(exec(&mut tpm, &lock_reset(b"")), 0x921);
+    assert_eq!(exec(&mut tpm, &shutdown(false)), 0);
+    tpm.init();
+    assert_eq!(exec(&mut tpm, &startup(false)), 0);
+    assert_eq!(exec(&mut tpm, &lock_reset(b"")), 0);
+}
+
+/// `DAStartup`: a Startup after no orderly shutdown counts a failure, since one may have gone
+/// unrecorded, up to `maxTries`; an orderly one counts nothing.
+#[test]
+fn a_startup_after_no_orderly_shutdown_counts_a_failure() {
+    let (mut tpm, _) = clocked_started(0);
+    let restart = |tpm: &mut Janus<Clocked>, orderly: bool| {
+        if orderly {
+            assert_eq!(exec(tpm, &shutdown(false)), 0);
+        }
+        tpm.init();
+        assert_eq!(exec(tpm, &startup(false)), 0);
+        da_state(tpm).0[0]
+    };
+    assert_eq!(restart(&mut tpm, false), 1);
+    assert_eq!(restart(&mut tpm, true), 1);
+    assert_eq!(restart(&mut tpm, false), 2);
+    assert_eq!(restart(&mut tpm, false), 3);
+    assert_eq!(restart(&mut tpm, false), 3, "no further than maxTries");
+    // The counter survives _TPM_Init, as the reference keeps it in NV.
+    assert_eq!(da_state(&mut tpm), ([3, 3, 1000, 1000], true));
+}
+
+/// DictionaryAttackParameters sets the limit and both recovery times, under the lockout
+/// hierarchy only; a `recoveryTime` of 0 turns the counter off (`IncrementLockout` still
+/// answers TPM_RC_AUTH_FAIL).
+#[test]
+fn dictionary_attack_parameters_set_the_limits() {
+    let (mut tpm, _) = clocked_started(0);
+    // TPMI_RH_LOCKOUT: TPM_RC_VALUE on the handle for any other.
+    assert_eq!(exec(&mut tpm, &da_parameters(OWNER, b"", 5, 10, 20)), 0x184);
+    let mut reset = lock_reset(b"");
+    reset[10..14].copy_from_slice(&OWNER.to_be_bytes());
+    assert_eq!(exec(&mut tpm, &reset), 0x184);
+    // A parameter missing: TPM_RC_INSUFFICIENT on it.
+    let mut short = da_parameters(LOCKOUT, b"", 5, 10, 20);
+    short.truncate(short.len() - 4);
+    let size = (short.len() as u32).to_be_bytes();
+    short[2..6].copy_from_slice(&size);
+    assert_eq!(exec(&mut tpm, &short), 0x3DA);
+    assert_eq!(exec(&mut tpm, &da_parameters(LOCKOUT, b"", 5, 10, 20)), 0);
+    assert_eq!(da_state(&mut tpm), ([0, 5, 10, 20], false));
+
+    let index = 0x0150_0000;
+    assert_eq!(exec(&mut tpm, &nv_define_pin(index, b"pin", false)), 0);
+    assert_eq!(exec(&mut tpm, &da_parameters(LOCKOUT, b"", 1, 0, 20)), 0);
+    assert_eq!(exec(&mut tpm, &nv_read_with(index, index, b"no")), 0x98E);
+    assert_eq!(da_state(&mut tpm), ([0, 1, 0, 20], false));
+    assert_eq!(exec(&mut tpm, &nv_read_with(index, index, b"pin")), 0x14A);
+}

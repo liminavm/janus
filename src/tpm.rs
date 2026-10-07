@@ -148,6 +148,11 @@ const CLOCK_SAVE_INTERVAL: u64 = 1 << 22;
 
 impl<S> Tpm<S> {
     /// Advances `Clock` to the platform's `now`.
+    /// `Time`: milliseconds since `_TPM_Init`.
+    fn time(&self) -> u64 {
+        self.clocks.last.saturating_sub(self.clocks.init_at)
+    }
+
     fn tick(&mut self, now: u64) {
         let elapsed = now.saturating_sub(self.clocks.last);
         self.clocks.last = self.clocks.last.max(now);
@@ -190,14 +195,14 @@ impl<P: Platform> Janus<P> {
             nv: NvStore::default(),
             // A new TPM's first Startup must be a Startup(CLEAR), and it finds the state
             // orderly (`TPM_Manufacture` writes `orderlyState = TPM_SU_CLEAR`): its clock is
-            // safe.
+            // safe and no dictionary-attack failure is counted.
             orderly: Some(Orderly::Clear),
         };
         let now = platform.now_ms();
         let tpm = Tpm {
             persistent,
             clocks: Clocks { last: now, init_at: now },
-            lockout: Lockout { lockout_auth_failed: false },
+            lockout: Lockout::manufactured(),
             stage: Initialized { carried: None },
         };
         Janus { platform, lifecycle: Some(Lifecycle::Initialized(Box::new(tpm))) }
@@ -237,7 +242,10 @@ impl<P: Platform> Janus<P> {
         let mut lifecycle = self.lifecycle.take().expect("the TPM is between stages");
         match &mut lifecycle {
             Lifecycle::Initialized(t) => t.tick(now),
-            Lifecycle::Running(t) => t.tick(now),
+            Lifecycle::Running(t) => {
+                t.tick(now);
+                t.lockout.self_heal(t.time());
+            }
         }
         let (next, result) = match lifecycle {
             Lifecycle::Initialized(tpm) if cmd.cc == Cc::Startup => {
@@ -344,6 +352,9 @@ impl Tpm<Initialized> {
         if !was_orderly {
             self.persistent.clock_safe = false;
         }
+        self.lockout.startup(was_orderly);
+        let time = self.time();
+        self.lockout.self_heal(time);
         let running = Tpm {
             persistent: self.persistent,
             clocks: self.clocks,
@@ -402,6 +413,14 @@ fn hierarchy_value<'a>(
         HierarchyAuth::Endorsement => &p.endorsement_auth,
         HierarchyAuth::Lockout => &p.lockout_auth,
         HierarchyAuth::Platform => platform_auth,
+    }
+}
+
+/// `TPMI_RH_LOCKOUT`: `TPM_RH_LOCKOUT` and nothing else (VALUE on the first handle).
+fn lockout_handle(h: u32) -> Result<HierarchyAuth, Rc> {
+    match HierarchyAuth::from_handle(h) {
+        Some(HierarchyAuth::Lockout) => Ok(HierarchyAuth::Lockout),
+        _ => Err(Rc::Fmt1(Fmt1::Value, Some(At::handle(1)))),
     }
 }
 
@@ -487,7 +506,7 @@ impl Tpm<Running> {
             Cc::Shutdown => {
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let kind = StartupType::read(&mut r).at(At::param(1))?;
                 r.finish().map_err(Rc::bare)?;
@@ -500,7 +519,7 @@ impl Tpm<Running> {
             Cc::SelfTest => {
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 bool::read(&mut r).at(At::param(1))?;
                 r.finish().map_err(Rc::bare)?;
@@ -509,7 +528,7 @@ impl Tpm<Running> {
             Cc::GetCapability => {
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let capability = r.u32().at(At::param(1))?;
                 let property = r.u32().at(At::param(2))?;
@@ -522,7 +541,7 @@ impl Tpm<Running> {
             Cc::GetRandom => {
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let requested = r.u16().at(At::param(1))?;
                 r.finish().map_err(Rc::bare)?;
@@ -535,7 +554,7 @@ impl Tpm<Running> {
             Cc::ReadClock => {
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 Reader::new(&params).finish().map_err(Rc::bare)?;
                 // TPMS_TIME_INFO: time, then TPMS_CLOCK_INFO.
                 let mut out = Writer::new();
@@ -549,7 +568,7 @@ impl Tpm<Running> {
             Cc::PcrRead => {
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let selection = pcr::read_selection_list(&mut r).at(At::param(1))?;
                 r.finish().map_err(Rc::bare)?;
@@ -583,7 +602,7 @@ impl Tpm<Running> {
                     &mut self.lockout,
                     self.stage.pcrs.counter(),
                 )?;
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let digests = read_digest_values(&mut r).at(At::param(1))?;
                 r.finish().map_err(Rc::bare)?;
@@ -598,7 +617,7 @@ impl Tpm<Running> {
                 let mut auth = self.read_auth(&mut cmd, names)?;
                 let raw = cmd.params();
                 let provision = self.authorize_hierarchy(&mut auth, raw, provision)?;
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 // TPMI_DH_PERSISTENT.
                 let persistent = r.u32().at(At::param(1))?;
@@ -615,7 +634,7 @@ impl Tpm<Running> {
                 let mut auth = self.read_auth(&mut cmd, vec![handle_name(a)])?;
                 let raw = cmd.params();
                 self.authorize_hierarchy(&mut auth, raw, provision)?;
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let value = r.tpm2b::<MAX_DIGEST>().at(At::param(1))?;
                 let public = Tpm2b::<NvPublic>::read(&mut r).at(At::param(2))?.0;
@@ -633,7 +652,7 @@ impl Tpm<Running> {
                 let mut auth = self.read_auth(&mut cmd, names)?;
                 let raw = cmd.params();
                 self.authorize_hierarchy(&mut auth, raw, provision)?;
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 Reader::new(&params).finish().map_err(Rc::bare)?;
                 self.persistent.nv.undefine(provision == HierarchyAuth::Platform, index)?;
                 (None, Writer::new(), auth)
@@ -677,7 +696,7 @@ impl Tpm<Running> {
                         self.authorize_hierarchy(&mut auth, raw, h)?;
                     }
                 }
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let mut out = Writer::new();
                 let orderly = match cc {
@@ -713,7 +732,7 @@ impl Tpm<Running> {
                 let index = self.nv_find(index, 1)?;
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 Reader::new(&params).finish().map_err(Rc::bare)?;
                 let public = &self.persistent.nv.get(index).public;
                 let mut out = Writer::new();
@@ -728,7 +747,7 @@ impl Tpm<Running> {
                 let mut auth = self.read_auth(&mut cmd, vec![handle_name(h)])?;
                 let raw = cmd.params();
                 let hierarchy = self.authorize_hierarchy(&mut auth, raw, hierarchy)?;
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let new = AuthValue::from_wire(r.tpm2b::<MAX_DIGEST>().at(At::param(1))?);
                 r.finish().map_err(Rc::bare)?;
@@ -736,6 +755,35 @@ impl Tpm<Running> {
                 // the command).
                 auth.set_response_auth(0, &new);
                 self.hierarchy_change_auth(hierarchy, new);
+                (None, Writer::new(), auth)
+            }
+            // TPM2_DictionaryAttackLockReset: the lockout hierarchy clears the failure count.
+            Cc::DictionaryAttackLockReset => {
+                let [h] = cmd.handles()?;
+                let lockout = lockout_handle(h)?;
+                let mut auth = self.read_auth(&mut cmd, vec![handle_name(h)])?;
+                let raw = cmd.params();
+                self.authorize_hierarchy(&mut auth, raw, lockout)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
+                Reader::new(&params).finish().map_err(Rc::bare)?;
+                self.lockout.reset();
+                (None, Writer::new(), auth)
+            }
+            // TPM2_DictionaryAttackParameters: the lockout hierarchy sets the limit and the two
+            // recovery times. The failure count is left as it is.
+            Cc::DictionaryAttackParameters => {
+                let [h] = cmd.handles()?;
+                let lockout = lockout_handle(h)?;
+                let mut auth = self.read_auth(&mut cmd, vec![handle_name(h)])?;
+                let raw = cmd.params();
+                self.authorize_hierarchy(&mut auth, raw, lockout)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
+                let mut r = Reader::new(&params);
+                let max_tries = r.u32().at(At::param(1))?;
+                let recovery_time = r.u32().at(At::param(2))?;
+                let lockout_recovery = r.u32().at(At::param(3))?;
+                r.finish().map_err(Rc::bare)?;
+                self.lockout.set_parameters(max_tries, recovery_time, lockout_recovery);
                 (None, Writer::new(), auth)
             }
             Cc::CreatePrimary => {
@@ -763,7 +811,7 @@ impl Tpm<Running> {
                     &mut self.lockout,
                     self.stage.pcrs.counter(),
                 )?;
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let sensitive = Tpm2b::<SensitiveCreate>::read(&mut r).at(At::param(1))?.0;
                 let template = Tpm2b::<crate::types::Public>::read(&mut r).at(At::param(2))?.0;
@@ -785,7 +833,7 @@ impl Tpm<Running> {
                 let target = self.object_handle(h, false, 1)?;
                 let mut auth = self.read_auth(&mut cmd, vec![self.name_of_object(target)])?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 Reader::new(&params).finish().map_err(Rc::bare)?;
                 let o = self.object(target.expect("ReadPublic refuses NULL"));
                 let mut out = Writer::new();
@@ -805,7 +853,7 @@ impl Tpm<Running> {
                 let names = vec![self.name_of_object(tpm_key), self.entity_name(bind, bind_loaded)];
                 let mut auth = self.read_auth(&mut cmd, names)?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let input = StartAuthSessionIn {
                     nonce_caller: Buf::read(&mut r).at(At::param(1))?,
@@ -825,7 +873,7 @@ impl Tpm<Running> {
                 let target = self.resolve_context(target)?;
                 let mut auth = self.read_auth(&mut cmd, vec![handle_name(h)])?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 Reader::new(&params).finish().map_err(Rc::bare)?;
                 let out = self.context_save(target, h)?;
                 (None, out, auth)
@@ -833,7 +881,7 @@ impl Tpm<Running> {
             Cc::ContextLoad => {
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let context = Context::read(&mut r).at(At::param(1))?;
                 r.finish().map_err(Rc::bare)?;
@@ -843,7 +891,7 @@ impl Tpm<Running> {
             Cc::FlushContext => {
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let h = r.u32().at(At::param(1))?;
                 let target = ContextHandle::from_handle(h).ok_or(Fmt1::Value).at(At::param(1))?;
@@ -857,7 +905,7 @@ impl Tpm<Running> {
                 let mut auth = self.read_auth(&mut cmd, vec![self.name_of_object(Some(parent))])?;
                 let raw = cmd.params();
                 let parent = self.authorize_object(&mut auth, raw, parent)?;
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let sensitive = Tpm2b::<SensitiveCreate>::read(&mut r).at(At::param(1))?.0;
                 let template = Tpm2b::<crate::types::Public>::read(&mut r).at(At::param(2))?.0;
@@ -879,7 +927,7 @@ impl Tpm<Running> {
                 let mut auth = self.read_auth(&mut cmd, vec![self.name_of_object(Some(parent))])?;
                 let raw = cmd.params();
                 let parent = self.authorize_object(&mut auth, raw, parent)?;
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let private = object::Private::read(&mut r).at(At::param(1))?;
                 let public = Tpm2b::<crate::types::Public>::read(&mut r).at(At::param(2))?.0;
@@ -893,7 +941,7 @@ impl Tpm<Running> {
                 let mut auth = self.read_auth(&mut cmd, vec![self.name_of_object(Some(item))])?;
                 let raw = cmd.params();
                 let item = self.authorize_object(&mut auth, raw, item)?.entity();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 Reader::new(&params).finish().map_err(Rc::bare)?;
                 let o = self.object(item);
                 let SensitiveKind::KeyedHash(data) = &o.sensitive.kind else {
@@ -917,14 +965,14 @@ impl Tpm<Running> {
                 let session = self.policy_session(h)?;
                 let mut auth = self.read_auth(&mut cmd, vec![handle_name(h)])?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let out = self.policy(cc, session, &params)?;
                 (None, out, auth)
             }
             Cc::Hash => {
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let data = Buf::<MAX_BUFFER>::read(&mut r).at(At::param(1))?;
                 let hash = Hash::read(&mut r).at(At::param(2))?;
@@ -942,7 +990,7 @@ impl Tpm<Running> {
             Cc::TestParms => {
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 // Everything TPM2_TestParms checks, unmarshalling checks.
                 crate::types::PublicParms::read(&mut r).at(At::param(1))?;
@@ -952,7 +1000,7 @@ impl Tpm<Running> {
             Cc::EccParameters => {
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let curve = crate::types::EccCurve::read(&mut r).at(At::param(1))?;
                 r.finish().map_err(Rc::bare)?;
@@ -966,7 +1014,7 @@ impl Tpm<Running> {
                 let mut auth = self.read_auth(&mut cmd, vec![self.name_of_object(Some(key))])?;
                 let raw = cmd.params();
                 let key = self.authorize_object(&mut auth, raw, key)?.entity();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let out = if cc == Cc::Sign {
                     let digest = Digest2b::read(&mut r).at(At::param(1))?;
@@ -986,7 +1034,7 @@ impl Tpm<Running> {
             Cc::HashSequenceStart => {
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;
                 let raw = cmd.params();
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let value = crate::types::Secret::<MAX_DIGEST>::read(&mut r).at(At::param(1))?;
                 // TPMI_ALG_HASH+: NULL starts an event sequence.
@@ -1013,7 +1061,7 @@ impl Tpm<Running> {
                     Ok(q) => Ok(self.authorize_sequence(&mut auth, raw, q)?.entity()),
                     Err(l) => Err(self.authorize_object(&mut auth, raw, l)?.entity()),
                 };
-                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
                 let data = Buf::<MAX_BUFFER>::read(&mut r).at(At::param(1))?;
                 let hierarchy = if cc == Cc::SequenceComplete {
@@ -1057,6 +1105,8 @@ impl Tpm<Running> {
             owner_auth_set: !p.owner_auth.is_empty(),
             endorsement_auth_set: !p.endorsement_auth.is_empty(),
             lockout_auth_set: !p.lockout_auth.is_empty(),
+            in_lockout: self.lockout.in_lockout(),
+            lockout: self.lockout.properties(),
             orderly: p.orderly.is_some(),
             transient: self.stage.objects.handles_from(0),
             persistent: self.persistent.evicted.handles_from(0),

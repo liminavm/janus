@@ -147,7 +147,7 @@ mod tests {
 /// The framing proof's unwind bound, which `cargo test` checks against the command table so a
 /// new command cannot quietly outgrow it.
 #[cfg(test)]
-const FRAME_PROOF_UNWIND: usize = 40;
+const FRAME_PROOF_UNWIND: usize = 44;
 
 #[cfg(test)]
 #[test]
@@ -168,7 +168,7 @@ mod proofs {
     /// Framing looks the command code up in `cc::IMPLEMENTED`, so the bound must exceed its
     /// length; `the_frame_proof_unwinds_the_whole_command_table` holds it to that.
     #[kani::proof]
-    #[kani::unwind(40)]
+    #[kani::unwind(44)]
     fn a_frame_has_exactly_the_size_its_header_claims() {
         let data: [u8; 14] = kani::any();
         let len: usize = kani::any_where(|l| *l <= 14);

@@ -10,6 +10,8 @@ pub enum Cc {
     HierarchyChangeAuth,
     NvDefineSpace,
     CreatePrimary,
+    DictionaryAttackLockReset,
+    DictionaryAttackParameters,
     SequenceComplete,
     SelfTest,
     Startup,
@@ -47,7 +49,7 @@ pub enum Cc {
 }
 
 /// The implemented commands in `TPM_CC` order, which is the order `TPM_CAP_COMMANDS` lists them.
-pub const IMPLEMENTED: [Cc; 39] = [
+pub const IMPLEMENTED: [Cc; 41] = [
     Cc::EvictControl,
     Cc::NvUndefineSpace,
     Cc::HierarchyChangeAuth,
@@ -55,6 +57,8 @@ pub const IMPLEMENTED: [Cc; 39] = [
     Cc::CreatePrimary,
     Cc::NvExtend,
     Cc::NvWrite,
+    Cc::DictionaryAttackLockReset,
+    Cc::DictionaryAttackParameters,
     Cc::SequenceComplete,
     Cc::SelfTest,
     Cc::Startup,
@@ -130,6 +134,8 @@ impl Cc {
             Cc::HierarchyChangeAuth => 0x129,
             Cc::NvDefineSpace => 0x12A,
             Cc::CreatePrimary => 0x131,
+            Cc::DictionaryAttackLockReset => 0x139,
+            Cc::DictionaryAttackParameters => 0x13A,
             Cc::SequenceComplete => 0x13E,
             Cc::NvExtend => 0x136,
             Cc::NvWrite => 0x137,
@@ -176,6 +182,9 @@ impl Cc {
         match self {
             Cc::HierarchyChangeAuth => {
                 Attributes { nv: true, handles: 1, auth_handles: 1, decrypt: true, ..NONE }
+            }
+            Cc::DictionaryAttackLockReset | Cc::DictionaryAttackParameters => {
+                Attributes { nv: true, handles: 1, auth_handles: 1, ..NONE }
             }
             Cc::EvictControl | Cc::NvUndefineSpace => {
                 Attributes { nv: true, handles: 2, auth_handles: 1, ..NONE }

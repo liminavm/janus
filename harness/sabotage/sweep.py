@@ -331,6 +331,27 @@ SABOTAGES = [
         "            da: Da::Protected,\n            value_available: true,\n        };\n        auth.authorize(\n            &self.stage.reset.sessions,\n            params,\n            q,",
         "a_hash_sequence_survives_its_context_and_tickets_what_a_restricted_key_signs",
     ),
+    (
+        "a Startup after no orderly shutdown leaves the clock safe",
+        "src/tpm.rs",
+        "        if !was_orderly {",
+        "        if false && !was_orderly {",
+        "the_clock_runs_while_the_tpm_does_and_time_since_init",
+    ),
+    (
+        "a platform clock that steps back makes the TPM clock run twice",
+        "src/tpm.rs",
+        "        self.clocks.last = self.clocks.last.max(now);",
+        "        self.clocks.last = now;",
+        "the_clock_runs_while_the_tpm_does_and_time_since_init",
+    ),
+    (
+        "a Resume does not count as a restart",
+        "src/tpm.rs",
+        "                let mut reset = c.reset;\n                reset.restart_count = reset.restart_count.wrapping_add(1);\n                (Pcrs::resume(",
+        "                let reset = c.reset;\n                (Pcrs::resume(",
+        "the_clock_runs_while_the_tpm_does_and_time_since_init",
+    ),
 ]
 
 

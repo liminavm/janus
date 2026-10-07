@@ -27,6 +27,7 @@ pub enum Cc {
     EccParameters,
     GetCapability,
     GetRandom,
+    ReadClock,
     Hash,
     PcrRead,
     PolicyPcr,
@@ -39,7 +40,7 @@ pub enum Cc {
 }
 
 /// The implemented commands in `TPM_CC` order, which is the order `TPM_CAP_COMMANDS` lists them.
-pub const IMPLEMENTED: [Cc; 31] = [
+pub const IMPLEMENTED: [Cc; 32] = [
     Cc::HierarchyChangeAuth,
     Cc::CreatePrimary,
     Cc::SequenceComplete,
@@ -66,6 +67,7 @@ pub const IMPLEMENTED: [Cc; 31] = [
     Cc::PcrRead,
     Cc::PolicyPcr,
     Cc::PolicyRestart,
+    Cc::ReadClock,
     Cc::PcrExtend,
     Cc::HashSequenceStart,
     Cc::PolicyGetDigest,
@@ -131,6 +133,7 @@ impl Cc {
             Cc::EccParameters => 0x178,
             Cc::GetCapability => 0x17A,
             Cc::GetRandom => 0x17B,
+            Cc::ReadClock => 0x181,
             Cc::Hash => 0x17D,
             Cc::PcrRead => 0x17E,
             Cc::PolicyPcr => 0x17F,
@@ -209,7 +212,7 @@ impl Cc {
             Cc::PolicyGetDigest => Attributes { handles: 1, encrypt: true, ..NONE },
             Cc::Hash => Attributes { decrypt: true, encrypt: true, ..NONE },
             Cc::TestParms | Cc::EccParameters => NONE,
-            Cc::GetCapability | Cc::PcrRead => NONE,
+            Cc::GetCapability | Cc::PcrRead | Cc::ReadClock => NONE,
             Cc::GetRandom => Attributes { encrypt: true, ..NONE },
             Cc::PcrExtend => Attributes { nv: true, handles: 1, auth_handles: 1, ..NONE },
         }

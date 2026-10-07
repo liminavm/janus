@@ -16,6 +16,9 @@ impl Platform for Zero {
     fn fill_random(&mut self, buf: &mut [u8]) {
         buf.fill(0);
     }
+    fn now_ms(&mut self) -> u64 {
+        0
+    }
 }
 
 fn cmd(tag: u16, cc: u32, body: &[u8]) -> Vec<u8> {

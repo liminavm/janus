@@ -11,6 +11,9 @@ impl Platform for Fixed {
     fn fill_random(&mut self, buf: &mut [u8]) {
         buf.fill(0x5A);
     }
+    fn now_ms(&mut self) -> u64 {
+        0
+    }
 }
 
 /// `TPM2_Startup(CLEAR)`.

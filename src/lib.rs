@@ -58,4 +58,9 @@ impl Locality {
 pub trait Platform {
     /// Fills `buf` from a cryptographically secure source.
     fn fill_random(&mut self, buf: &mut [u8]);
+
+    /// Milliseconds on a monotonic clock. Only differences between readings are used: the
+    /// TPM's `Clock` advances by them while the TPM runs, and its `Time` counts them since
+    /// `_TPM_Init`. A reading lower than the one before counts as no time.
+    fn now_ms(&mut self) -> u64;
 }

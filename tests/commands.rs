@@ -12,6 +12,9 @@ impl Platform for Zero {
     fn fill_random(&mut self, buf: &mut [u8]) {
         buf.fill(0);
     }
+    fn now_ms(&mut self) -> u64 {
+        0
+    }
 }
 
 const NO_SESSIONS: u16 = 0x8001;
@@ -491,6 +494,10 @@ impl Platform for Counting {
             *b = self.0;
         }
     }
+
+    fn now_ms(&mut self) -> u64 {
+        0
+    }
 }
 
 #[test]
@@ -541,4 +548,75 @@ fn policy_commands_refuse_what_is_not_a_loaded_policy_session() {
     assert_eq!(ok(&mut tpm, &get_digest(p))[12..], expected[..]);
     // A second, different command code: TPM_RC_VALUE on the parameter.
     assert_eq!(run(&mut tpm, &command_code(0x17B)), 0x1C4);
+}
+
+/// A platform whose clock the test sets.
+struct Clocked(std::rc::Rc<std::cell::Cell<u64>>);
+
+impl Platform for Clocked {
+    fn fill_random(&mut self, buf: &mut [u8]) {
+        buf.fill(0);
+    }
+
+    fn now_ms(&mut self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// TPM2_ReadClock's TPMS_TIME_INFO: time, clock, resetCount, restartCount, safe.
+fn read_clock(tpm: &mut Janus<Clocked>) -> (u64, u64, u32, u32, u8) {
+    let rsp = tpm.execute(Locality::ZERO, &cmd(NO_SESSIONS, 0x181, &[]));
+    assert_eq!(rc(&rsp), 0, "ReadClock");
+    assert_eq!(rsp.len(), 35);
+    let u64_at = |i: usize| u64::from_be_bytes(rsp[i..i + 8].try_into().unwrap());
+    let u32_at = |i: usize| u32::from_be_bytes(rsp[i..i + 4].try_into().unwrap());
+    (u64_at(10), u64_at(18), u32_at(26), u32_at(30), rsp[34])
+}
+
+#[test]
+fn the_clock_runs_while_the_tpm_does_and_time_since_init() {
+    let now = std::rc::Rc::new(std::cell::Cell::new(5_000u64));
+    let mut tpm = Janus::manufacture(Clocked(now.clone()));
+    tpm.init();
+    // Before Startup: TPM_RC_INITIALIZE, as swtpm answered the firmware (boot.jsonl).
+    let rsp = tpm.execute(Locality::ZERO, &cmd(NO_SESSIONS, 0x181, &[]));
+    assert_eq!(rc(&rsp), 0x100);
+    now.set(5_100);
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup(false))), 0);
+    now.set(5_250);
+    // The first Startup follows no shutdown at all: the clock is not safe.
+    assert_eq!(read_clock(&mut tpm), (250, 250, 1, 0, 0));
+
+    // An orderly Shutdown(STATE) and a Resume: time restarts, the clock goes on, one restart.
+    let power = |tpm: &mut Janus<Clocked>, state: bool, at: u64| {
+        assert_eq!(rc(&tpm.execute(Locality::ZERO, &shutdown(state))), 0);
+        now.set(at);
+        tpm.init();
+        assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup(state))), 0);
+    };
+    power(&mut tpm, true, 9_000);
+    now.set(9_040);
+    assert_eq!(read_clock(&mut tpm), (40, 4_040, 1, 1, 0));
+    // A platform clock reading earlier than the last counts as no time, nor does the way back.
+    now.set(8_000);
+    assert_eq!(read_clock(&mut tpm), (40, 4_040, 1, 1, 0));
+    now.set(9_040);
+    assert_eq!(read_clock(&mut tpm), (40, 4_040, 1, 1, 0));
+    // A Restart counts as a restart too.
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &shutdown(true))), 0);
+    tpm.init();
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup(false))), 0);
+    assert_eq!(read_clock(&mut tpm), (0, 4_040, 1, 2, 0));
+    // A Reset after an orderly Shutdown(CLEAR) zeroes restartCount and counts a reset.
+    power(&mut tpm, false, 9_040);
+    assert_eq!(read_clock(&mut tpm), (0, 4_040, 2, 0, 0));
+    // The clock becomes safe when it crosses a save boundary (2^22 ms), and stays so.
+    now.set(9_040 + (1 << 22));
+    assert_eq!(read_clock(&mut tpm).4, 1);
+    power(&mut tpm, false, 9_040 + (1 << 22));
+    assert_eq!(read_clock(&mut tpm).4, 1);
+    // A Startup with no orderly shutdown before it makes it unsafe again.
+    tpm.init();
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup(false))), 0);
+    assert_eq!(read_clock(&mut tpm).4, 0);
 }

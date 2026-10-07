@@ -56,6 +56,13 @@ struct Persistent {
     /// `TPM2_Clear` it is also the resets since the last Clear (`resetCount`), which
     /// `TPMS_CLOCK_INFO` reports.
     reset_count: u64,
+    /// Milliseconds the TPM has run since manufacture (`Clock`).
+    clock: u64,
+    /// `TPMS_CLOCK_INFO.safe`: the clock has not been reported higher than it is. A Startup
+    /// after no orderly shutdown clears it, since the clock may have been lost back to its last
+    /// save; it is set again when `Clock` crosses a save boundary, as the reference sets it when
+    /// it writes the clock to NV.
+    clock_safe: bool,
     /// The last `TPM2_Shutdown`, until a Startup takes it or a command makes it stale.
     orderly: Option<Orderly>,
 }
@@ -73,6 +80,8 @@ struct ResetState {
     sessions: SessionTable,
     /// Restarts since the last Reset; binds the saved contexts of `stClear` objects.
     clear_count: u32,
+    /// Restarts and Resumes since the last Reset (`restartCount`).
+    restart_count: u32,
     /// The sequence the last saved object context got (`objectContextID`).
     object_sequence: u64,
 }
@@ -83,6 +92,7 @@ impl ResetState {
             null: NullSecrets::generate(platform),
             sessions: SessionTable::default(),
             clear_count: 0,
+            restart_count: 0,
             object_sequence: 0,
         }
     }
@@ -111,10 +121,33 @@ pub struct Running {
 
 pub struct Tpm<S> {
     persistent: Persistent,
+    clocks: Clocks,
     /// Kept apart from [`Persistent`] so the authorization check can update it while it reads
     /// an authorization value from there.
     lockout: Lockout,
     stage: S,
+}
+
+/// Platform clock readings: the last one `Clock` was advanced to, and the one at `_TPM_Init`.
+struct Clocks {
+    last: u64,
+    init_at: u64,
+}
+
+/// `Clock` is saved to NV when it crosses a multiple of 2^22 ms (`NV_CLOCK_UPDATE_INTERVAL`).
+const CLOCK_SAVE_INTERVAL: u64 = 1 << 22;
+
+impl<S> Tpm<S> {
+    /// Advances `Clock` to the platform's `now`.
+    fn tick(&mut self, now: u64) {
+        let elapsed = now.saturating_sub(self.clocks.last);
+        self.clocks.last = self.clocks.last.max(now);
+        let before = self.persistent.clock;
+        self.persistent.clock = before.saturating_add(elapsed);
+        if self.persistent.clock / CLOCK_SAVE_INTERVAL > before / CLOCK_SAVE_INTERVAL {
+            self.persistent.clock_safe = true;
+        }
+    }
 }
 
 enum Lifecycle {
@@ -142,10 +175,14 @@ impl<P: Platform> Janus<P> {
             lockout_auth: AuthValue::empty(),
             secrets: PersistentSecrets::generate(&mut platform),
             reset_count: 0,
+            clock: 0,
+            clock_safe: true,
             orderly: None,
         };
+        let now = platform.now_ms();
         let tpm = Tpm {
             persistent,
+            clocks: Clocks { last: now, init_at: now },
             lockout: Lockout { lockout_auth_failed: false },
             stage: Initialized { carried: None },
         };
@@ -155,16 +192,19 @@ impl<P: Platform> Janus<P> {
     /// `_TPM_Init`: the platform was reset. Everything that does not survive a power cycle is
     /// gone, and the TPM waits for `TPM2_Startup` again.
     pub fn init(&mut self) {
-        let next = match self.lifecycle.take().expect("the TPM is between stages") {
+        let now = self.platform.now_ms();
+        let mut next = match self.lifecycle.take().expect("the TPM is between stages") {
             Lifecycle::Initialized(t) => t,
             Lifecycle::Running(t) => {
-                let Tpm { persistent, lockout, stage } = *t;
+                let Tpm { persistent, clocks, lockout, stage } = *t;
                 let Running { platform_auth, mut reset, .. } = stage;
                 reset.sessions.drop_loaded();
                 let carried = Some(Box::new(Carried { platform_auth, reset }));
-                Box::new(Tpm { persistent, lockout, stage: Initialized { carried } })
+                Box::new(Tpm { persistent, clocks, lockout, stage: Initialized { carried } })
             }
         };
+        next.tick(now);
+        next.clocks.init_at = now;
         self.lifecycle = Some(Lifecycle::Initialized(next));
     }
 
@@ -179,7 +219,13 @@ impl<P: Platform> Janus<P> {
 
     fn dispatch(&mut self, locality: Locality, bytes: &[u8]) -> Result<Vec<u8>, Rc> {
         let cmd = command::frame(bytes)?;
-        let (next, result) = match self.lifecycle.take().expect("the TPM is between stages") {
+        let now = self.platform.now_ms();
+        let mut lifecycle = self.lifecycle.take().expect("the TPM is between stages");
+        match &mut lifecycle {
+            Lifecycle::Initialized(t) => t.tick(now),
+            Lifecycle::Running(t) => t.tick(now),
+        }
+        let (next, result) = match lifecycle {
             Lifecycle::Initialized(tpm) if cmd.cc == Cc::Startup => {
                 match (*tpm).startup(&mut self.platform, locality, cmd) {
                     Ok((running, response)) => {
@@ -257,10 +303,13 @@ impl Tpm<Initialized> {
             return Err(Box::new((self, Warn::Locality.into())));
         }
         let orderly = self.persistent.orderly.take();
+        let was_orderly = orderly.is_some();
         let carried = self.stage.carried.take();
         let (pcrs, platform_auth, reset) = match (kind, orderly, carried) {
             (StartupType::State, Some(Orderly::State(saved)), Some(c)) => {
-                (Pcrs::resume(&saved, locality), c.platform_auth, c.reset)
+                let mut reset = c.reset;
+                reset.restart_count = reset.restart_count.wrapping_add(1);
+                (Pcrs::resume(&saved, locality), c.platform_auth, reset)
             }
             (StartupType::State, _, _) => {
                 return Err(Box::new((self, Rc::Fmt1(Fmt1::Value, Some(At::param(1))))));
@@ -268,6 +317,7 @@ impl Tpm<Initialized> {
             (StartupType::Clear, Some(Orderly::State(saved)), Some(c)) => {
                 let mut reset = c.reset;
                 reset.clear_count = reset.clear_count.wrapping_add(1);
+                reset.restart_count = reset.restart_count.wrapping_add(1);
                 (Pcrs::restart(&saved, locality), AuthValue::empty(), reset)
             }
             (StartupType::Clear, _, _) => {
@@ -275,8 +325,12 @@ impl Tpm<Initialized> {
                 (Pcrs::reset(locality), AuthValue::empty(), ResetState::new(platform))
             }
         };
+        if !was_orderly {
+            self.persistent.clock_safe = false;
+        }
         let running = Tpm {
             persistent: self.persistent,
+            clocks: self.clocks,
             lockout: self.lockout,
             stage: Running { pcrs, platform_auth, reset, objects: Objects::default() },
         };
@@ -434,6 +488,20 @@ impl Tpm<Running> {
                 platform.fill_random(&mut bytes);
                 let mut out = Writer::new();
                 out.tpm2b(&bytes);
+                (None, out, auth)
+            }
+            Cc::ReadClock => {
+                let mut auth = self.read_auth(&mut cmd, Vec::new())?;
+                let raw = cmd.params();
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                Reader::new(&params).finish().map_err(Rc::bare)?;
+                // TPMS_TIME_INFO: time, then TPMS_CLOCK_INFO.
+                let mut out = Writer::new();
+                out.u64(self.clocks.last - self.clocks.init_at);
+                out.u64(self.persistent.clock);
+                out.u32(self.persistent.reset_count as u32);
+                out.u32(self.stage.reset.restart_count);
+                out.u8(u8::from(self.persistent.clock_safe));
                 (None, out, auth)
             }
             Cc::PcrRead => {

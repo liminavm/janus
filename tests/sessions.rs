@@ -36,6 +36,10 @@ impl Platform for Recorder {
         }
         self.given.borrow_mut().push(buf.to_vec());
     }
+
+    fn now_ms(&mut self) -> u64 {
+        0
+    }
 }
 
 const SHA256: u16 = 0x000B;

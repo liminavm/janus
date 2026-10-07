@@ -32,6 +32,10 @@ impl Platform for Counter {
             *b = self.0;
         }
     }
+
+    fn now_ms(&mut self) -> u64 {
+        0
+    }
 }
 
 fn hex(s: &str) -> Vec<u8> {

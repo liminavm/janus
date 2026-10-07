@@ -188,7 +188,10 @@ impl<P: Platform> Janus<P> {
             clock_safe: true,
             evicted: Evicted::default(),
             nv: NvStore::default(),
-            orderly: None,
+            // A new TPM's first Startup must be a Startup(CLEAR), and it finds the state
+            // orderly (`TPM_Manufacture` writes `orderlyState = TPM_SU_CLEAR`): its clock is
+            // safe.
+            orderly: Some(Orderly::Clear),
         };
         let now = platform.now_ms();
         let tpm = Tpm {

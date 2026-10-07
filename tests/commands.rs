@@ -584,8 +584,8 @@ fn the_clock_runs_while_the_tpm_does_and_time_since_init() {
     now.set(5_100);
     assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup(false))), 0);
     now.set(5_250);
-    // The first Startup follows no shutdown at all: the clock is not safe.
-    assert_eq!(read_clock(&mut tpm), (250, 250, 1, 0, 0));
+    // A new TPM is manufactured orderly (`TPM_Manufacture`): its first clock is safe.
+    assert_eq!(read_clock(&mut tpm), (250, 250, 1, 0, 1));
 
     // An orderly Shutdown(STATE) and a Resume: time restarts, the clock goes on, one restart.
     let power = |tpm: &mut Janus<Clocked>, state: bool, at: u64| {
@@ -596,29 +596,29 @@ fn the_clock_runs_while_the_tpm_does_and_time_since_init() {
     };
     power(&mut tpm, true, 9_000);
     now.set(9_040);
-    assert_eq!(read_clock(&mut tpm), (40, 4_040, 1, 1, 0));
+    assert_eq!(read_clock(&mut tpm), (40, 4_040, 1, 1, 1));
     // A platform clock reading earlier than the last counts as no time, nor does the way back.
     now.set(8_000);
-    assert_eq!(read_clock(&mut tpm), (40, 4_040, 1, 1, 0));
+    assert_eq!(read_clock(&mut tpm), (40, 4_040, 1, 1, 1));
     now.set(9_040);
-    assert_eq!(read_clock(&mut tpm), (40, 4_040, 1, 1, 0));
+    assert_eq!(read_clock(&mut tpm), (40, 4_040, 1, 1, 1));
     // A Restart counts as a restart too.
     assert_eq!(rc(&tpm.execute(Locality::ZERO, &shutdown(true))), 0);
     tpm.init();
     assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup(false))), 0);
-    assert_eq!(read_clock(&mut tpm), (0, 4_040, 1, 2, 0));
+    assert_eq!(read_clock(&mut tpm), (0, 4_040, 1, 2, 1));
     // A Reset after an orderly Shutdown(CLEAR) zeroes restartCount and counts a reset.
     power(&mut tpm, false, 9_040);
-    assert_eq!(read_clock(&mut tpm), (0, 4_040, 2, 0, 0));
-    // The clock becomes safe when it crosses a save boundary (2^22 ms), and stays so.
+    assert_eq!(read_clock(&mut tpm), (0, 4_040, 2, 0, 1));
+    // A Startup with no orderly shutdown before it makes the clock unsafe.
+    tpm.init();
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup(false))), 0);
+    assert_eq!(read_clock(&mut tpm), (0, 4_040, 3, 0, 0));
+    // It becomes safe again when it crosses a save boundary (2^22 ms), and stays so.
     now.set(9_040 + (1 << 22));
     assert_eq!(read_clock(&mut tpm).4, 1);
     power(&mut tpm, false, 9_040 + (1 << 22));
     assert_eq!(read_clock(&mut tpm).4, 1);
-    // A Startup with no orderly shutdown before it makes it unsafe again.
-    tpm.init();
-    assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup(false))), 0);
-    assert_eq!(read_clock(&mut tpm).4, 0);
 }
 
 /// `TPM_CAP_ALGS` lists every algorithm a client may name in a command janus implements, with

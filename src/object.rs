@@ -4,7 +4,7 @@
 //! slots loaded ones live in.
 
 use crate::alg::{Hash, MAX_DIGEST};
-use crate::crypto::{self, Drbg, EccPrivate};
+use crate::crypto::{self, Drbg, EccPrivate, RsaPrivate};
 use crate::handle::{handle_type, ht};
 use crate::hierarchy::Hierarchy;
 use crate::marshal::{Marshal, Tpm2b, Unmarshal};
@@ -295,8 +295,7 @@ const PRIMARY_LABEL: &[u8] = b"Primary Object Creation";
 /// the hierarchy's seed, the template's name and the caller's sensitive data, so the same
 /// template under the same seed gives the same object every time.
 ///
-/// `template` has passed [`validate_template`]. An RSA template is [`Unsupported::Rsa`] until
-/// RSA key generation lands.
+/// `template` has passed [`validate_template`].
 pub fn create_primary(
     seed: &[u8],
     hierarchy: Hierarchy,
@@ -380,7 +379,12 @@ fn generate(
             s.unique = unique_digest(name_alg, seed_secret.as_slice(), key.as_slice());
             SensitiveKind::SymCipher(key)
         }
-        PublicKind::Rsa(_) => return Err(Unsupported::Rsa),
+        PublicKind::Rsa(r) => {
+            let e = crypto::rsa_exponent(r.parms.exponent).ok_or(Unsupported::Range)?;
+            let key = RsaPrivate::generate(drbg, e);
+            r.unique = Buf::from_slice(&key.modulus()).expect("a 2048-bit modulus fits");
+            SensitiveKind::Rsa(secret(&key.prime()))
+        }
     };
     let auth = secret(trim(sensitive.user_auth.as_slice()));
     let qualified_name = qualified_name(name_alg, parent_qualified_name, &template.name());
@@ -517,9 +521,22 @@ pub fn load(
                 return Err(binding);
             }
         }
-        // No RSA object can have been wrapped by janus yet.
-        (PublicKind::Rsa(_), SensitiveKind::Rsa(_)) => {
-            return Err(Rc::Fmt1(Fmt1::Type, Some(public_at)));
+        (PublicKind::Rsa(r), SensitiveKind::Rsa(prime)) => {
+            let n = r.unique.as_slice();
+            if n.len() != crypto::RSA_MODULUS_BYTES || n[0] < 0x80 {
+                return Err(Rc::Fmt1(Fmt1::Key, Some(public_at)));
+            }
+            if r.parms.exponent != 0 && r.parms.exponent < 7 {
+                return Err(Rc::Fmt1(Fmt1::Value, Some(public_at)));
+            }
+            let p = prime.as_slice();
+            if p.len() != crypto::RSA_PRIME_BYTES || p[0] < 0x80 {
+                return Err(key_size);
+            }
+            // CryptRsaLoadPrivateExponent: the prime must divide the modulus.
+            if RsaPrivate::from_prime(n, rsa_exponent_of(r.parms.exponent), p).is_none() {
+                return Err(binding);
+            }
         }
         _ => return Err(Rc::Fmt1(Fmt1::Type, Some(private))),
     }
@@ -532,6 +549,36 @@ pub fn load(
     Ok(Object { public, sensitive, hierarchy: parent.hierarchy, qualified_name })
 }
 
+/// The exponent an RSA public area's `exponent` field stands for: zero is 65537.
+fn rsa_exponent_of(e: u32) -> u32 {
+    if e == 0 { crypto::RSA_DEFAULT_EXPONENT } else { e }
+}
+
+impl Object {
+    /// An RSA object's key. Its parts were checked to belong together when it was created or
+    /// loaded, so this is `None` only for an object that is not RSA.
+    pub fn rsa(&self) -> Option<RsaPrivate> {
+        let (PublicKind::Rsa(r), SensitiveKind::Rsa(p)) = (&self.public.kind, &self.sensitive.kind)
+        else {
+            return None;
+        };
+        let key = RsaPrivate::from_prime(
+            r.unique.as_slice(),
+            rsa_exponent_of(r.parms.exponent),
+            p.as_slice(),
+        );
+        Some(key.expect("an RSA object's prime divides its modulus"))
+    }
+
+    /// An ECC object's private key, likewise.
+    pub fn ecc(&self) -> Option<EccPrivate> {
+        let SensitiveKind::Ecc(d) = &self.sensitive.kind else {
+            return None;
+        };
+        Some(EccPrivate::from_bytes(d.as_slice()).expect("an ECC object's scalar is valid"))
+    }
+}
+
 /// `nameAlg || H(parent's qualified name || name)`. A primary object's parent is its hierarchy,
 /// whose qualified name is its handle.
 pub fn qualified_name(h: Hash, parent_qn: &[u8], name: &Name2b) -> Name2b {
@@ -542,10 +589,11 @@ pub fn qualified_name(h: Hash, parent_qn: &[u8], name: &Name2b) -> Name2b {
     Name2b::from_slice(&w.into_vec()).expect("a qualified name is a TPMT_HA")
 }
 
-/// What [`create_primary`] cannot make yet.
+/// Why [`create_primary`] or [`create`] makes nothing from a template that validated.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Unsupported {
-    Rsa,
+    /// An RSA exponent that is neither zero nor a prime of at least 65537 (`TPM_RC_RANGE`).
+    Range,
     /// Caller-provided symmetric key of the wrong size (`TPM_RC_KEY_SIZE`).
     KeySize,
 }

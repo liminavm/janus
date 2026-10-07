@@ -12,6 +12,8 @@ pub enum Cc {
     Shutdown,
     Create,
     Load,
+    RsaDecrypt,
+    Sign,
     Unseal,
     ContextLoad,
     ContextSave,
@@ -34,7 +36,7 @@ pub enum Cc {
 }
 
 /// The implemented commands in `TPM_CC` order, which is the order `TPM_CAP_COMMANDS` lists them.
-pub const IMPLEMENTED: [Cc; 26] = [
+pub const IMPLEMENTED: [Cc; 28] = [
     Cc::HierarchyChangeAuth,
     Cc::CreatePrimary,
     Cc::SelfTest,
@@ -42,6 +44,8 @@ pub const IMPLEMENTED: [Cc; 26] = [
     Cc::Shutdown,
     Cc::Create,
     Cc::Load,
+    Cc::RsaDecrypt,
+    Cc::Sign,
     Cc::Unseal,
     Cc::ContextLoad,
     Cc::ContextSave,
@@ -106,6 +110,8 @@ impl Cc {
             Cc::Shutdown => 0x145,
             Cc::Create => 0x153,
             Cc::Load => 0x157,
+            Cc::RsaDecrypt => 0x159,
+            Cc::Sign => 0x15D,
             Cc::Unseal => 0x15E,
             Cc::ContextLoad => 0x161,
             Cc::ContextSave => 0x162,
@@ -170,6 +176,10 @@ impl Cc {
                 encrypt: true,
                 ..NONE
             },
+            Cc::RsaDecrypt => {
+                Attributes { handles: 1, auth_handles: 1, decrypt: true, encrypt: true, ..NONE }
+            }
+            Cc::Sign => Attributes { handles: 1, auth_handles: 1, decrypt: true, ..NONE },
             Cc::Unseal => Attributes { handles: 1, auth_handles: 1, encrypt: true, ..NONE },
             Cc::PolicyPcr => Attributes { handles: 1, decrypt: true, ..NONE },
             Cc::PolicyAuthValue

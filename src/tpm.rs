@@ -38,7 +38,8 @@ use crate::session::{
     SessionTable, SessionType,
 };
 use crate::types::{
-    CreationData, Data2b, Digest2b, EccPoint, Name2b, PublicKind, SensitiveCreate, SymDef,
+    CreationData, Data2b, Digest2b, EccPoint, EccScheme, HashCheckTicket, KeyedHashScheme, Name2b,
+    PublicKind, RsaDecryptScheme, RsaScheme, ST_HASHCHECK, SensitiveCreate, SigScheme, SymDef,
     TkCreation,
 };
 use crate::wire::{Blame as _, Buf, Reader, Writer};
@@ -336,8 +337,8 @@ const MAX_ENCRYPTED_SECRET: usize = 256;
 
 /// `TPM_ST_CREATION`.
 const ST_CREATION: u16 = 0x8021;
-/// `TPM_ST_HASHCHECK`.
-const ST_HASHCHECK: u16 = 0x8024;
+/// The OAEP label of a salt encrypted to an RSA key (`SECRET_KEY`), its NUL included.
+const SECRET_LABEL: &[u8] = b"SECRET\0";
 /// `TPM_GENERATED_VALUE`, which starts every structure the TPM signs.
 const TPM_GENERATED_VALUE: u32 = 0xFF54_4347;
 /// `TPM_ALG_NULL`, a primary object's parent nameAlg.
@@ -728,6 +729,29 @@ impl Tpm<Running> {
                 crypto::ecc_parameters(curve, &mut out);
                 (None, out, auth)
             }
+            Cc::Sign | Cc::RsaDecrypt => {
+                let [h] = cmd.handles()?;
+                let key = self.object_handle(h, false, 1)?.expect("a TPMI_DH_OBJECT");
+                let mut auth = self.read_auth(&mut cmd, vec![self.name_of_object(Some(key))])?;
+                let raw = cmd.params();
+                let key = self.authorize_object(&mut auth, raw, key)?.entity();
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let mut r = Reader::new(&params);
+                let out = if cc == Cc::Sign {
+                    let digest = Digest2b::read(&mut r).at(At::param(1))?;
+                    let scheme = SigScheme::read(&mut r).at(At::param(2))?;
+                    let ticket = HashCheckTicket::read(&mut r).at(At::param(3))?;
+                    r.finish().map_err(Rc::bare)?;
+                    self.sign(platform, key, digest.as_slice(), scheme, ticket)?
+                } else {
+                    let c = Buf::<{ crypto::RSA_MODULUS_BYTES }>::read(&mut r).at(At::param(1))?;
+                    let scheme = RsaDecryptScheme::read(&mut r).at(At::param(2))?;
+                    let label = Data2b::read(&mut r).at(At::param(3))?;
+                    r.finish().map_err(Rc::bare)?;
+                    self.rsa_decrypt(platform, key, c.as_slice(), scheme, label.as_slice())?
+                };
+                (None, out, auth)
+            }
         };
         debug_assert_eq!(handle.is_some(), attributes.response_handle, "{cc:?}");
         let (params, area) = auth.respond(&mut self.stage.reset.sessions, platform, out.into_vec());
@@ -885,7 +909,7 @@ impl Tpm<Running> {
         let object =
             object::create_primary(self.secrets().seed(hierarchy), hierarchy, template, sensitive)
                 .map_err(|e| match e {
-                    object::Unsupported::Rsa => Rc::Fmt1(Fmt1::Type, Some(At::param(2))),
+                    object::Unsupported::Range => Rc::Fmt1(Fmt1::Range, None),
                     object::Unsupported::KeySize => Rc::Fmt1(Fmt1::KeySize, Some(At::param(1))),
                 })?;
         let name = object.name();
@@ -1000,7 +1024,7 @@ impl Tpm<Running> {
         platform.fill_random(&mut seed[..]);
         let mut drbg = crypto::Drbg::new(&seed[..], b"Object Creation", &[]);
         let child = object::create(p, template, sensitive, &mut drbg).map_err(|e| match e {
-            object::Unsupported::Rsa => Rc::Fmt1(Fmt1::Type, Some(At::param(2))),
+            object::Unsupported::Range => Rc::Fmt1(Fmt1::Range, None),
             object::Unsupported::KeySize => Rc::Fmt1(Fmt1::KeySize, Some(At::param(1))),
         })?;
         let mut iv = [0u8; 16];
@@ -1153,12 +1177,142 @@ impl Tpm<Running> {
         if hierarchy == Hierarchy::Null || data.starts_with(&TPM_GENERATED_VALUE.to_be_bytes()) {
             return HashCheck { hierarchy: crate::handle::rh::NULL, digest: Vec::new() };
         }
-        let d = crypto::hmac(
+        HashCheck {
+            hierarchy: hierarchy.handle(),
+            digest: self.hash_check_hmac(hierarchy, hash, digest).to_vec(),
+        }
+    }
+
+    /// The HMAC a hash-check ticket carries, under any hierarchy's proof, the NULL hierarchy's
+    /// included: `TPM2_Sign` recomputes it to check a ticket it is shown.
+    fn hash_check_hmac(
+        &self,
+        hierarchy: Hierarchy,
+        hash: Hash,
+        digest: &[u8],
+    ) -> zeroize::Zeroizing<Vec<u8>> {
+        crypto::hmac(
             Hash::Sha256,
             self.secrets().proof(hierarchy),
             &[&ST_HASHCHECK.to_be_bytes(), &hash.id().to_be_bytes(), digest],
-        );
-        HashCheck { hierarchy: hierarchy.handle(), digest: d.to_vec() }
+        )
+    }
+
+    /// `TPM2_Sign`, in the reference's order: a key that can sign (`TPM_RC_KEY`), not one
+    /// restricted to certificates (`TPM_RC_ATTRIBUTES`), a scheme the key allows
+    /// (`TPM_RC_SCHEME`), then a ticket that proves the TPM hashed the data when the key is
+    /// restricted or one is offered (`TPM_RC_TICKET`), or else a digest of the scheme's size.
+    fn sign(
+        &self,
+        platform: &mut impl Platform,
+        key: Loaded,
+        digest: &[u8],
+        scheme: SigScheme,
+        ticket: HashCheckTicket,
+    ) -> Result<Writer, Rc> {
+        let o = self.stage.objects.get(key);
+        let a = o.public.attributes;
+        if !a.sign_encrypt() || matches!(o.public.kind, PublicKind::SymCipher(_)) {
+            return Err(Rc::Fmt1(Fmt1::Key, Some(At::handle(1))));
+        }
+        if a.x509sign() {
+            return Err(Rc::Fmt1(Fmt1::Attributes, Some(At::handle(1))));
+        }
+        let scheme = sign_scheme(&o.public.kind, scheme)
+            .ok_or(Rc::Fmt1(Fmt1::Scheme, Some(At::param(2))))?;
+        let hash = scheme.1;
+        if !ticket.digest.as_slice().is_empty() || a.restricted() {
+            let expected = self.hash_check_hmac(ticket.hierarchy, hash, digest);
+            if !crypto::constant_time_eq(&expected, ticket.digest.as_slice()) {
+                return Err(Rc::Fmt1(Fmt1::Ticket, Some(At::param(3))));
+            }
+        } else if digest.len() != hash.size() {
+            return Err(Rc::Fmt1(Fmt1::Size, Some(At::param(1))));
+        }
+        let mut out = Writer::new();
+        out.u16(scheme.0);
+        hash.write(&mut out);
+        match scheme.0 {
+            crate::alg::id::RSASSA | crate::alg::id::RSAPSS => {
+                let pss = scheme.0 == crate::alg::id::RSAPSS;
+                let sig = o
+                    .rsa()
+                    .expect("an RSA scheme is only selected for an RSA key")
+                    .sign(&mut crypto::PlatformRng(platform), pss, digest)
+                    .ok_or(Fmt1::Value)
+                    .map_err(Rc::bare)?;
+                out.tpm2b(&sig);
+            }
+            crate::alg::id::ECDSA => {
+                let digest: &[u8; 32] =
+                    digest.try_into().map_err(|_| Rc::Fmt1(Fmt1::Size, Some(At::param(1))))?;
+                let (r, s) = o.ecc().expect("ECDSA is only selected for an ECC key").sign(digest);
+                out.tpm2b(&r);
+                out.tpm2b(&s);
+            }
+            crate::alg::id::HMAC => {
+                let SensitiveKind::KeyedHash(k) = &o.sensitive.kind else {
+                    unreachable!("HMAC is only selected for a keyed-hash key");
+                };
+                out.bytes(&crypto::hmac(hash, k.as_slice(), &[digest]));
+            }
+            other => unreachable!("sign_scheme() selected {other:#x}"),
+        }
+        Ok(out)
+    }
+
+    /// `TPM2_RSA_Decrypt`, in the reference's order.
+    fn rsa_decrypt(
+        &self,
+        platform: &mut impl Platform,
+        key: Loaded,
+        c: &[u8],
+        scheme: RsaDecryptScheme,
+        label: &[u8],
+    ) -> Result<Writer, Rc> {
+        let o = self.stage.objects.get(key);
+        let PublicKind::Rsa(r) = &o.public.kind else {
+            return Err(Rc::Fmt1(Fmt1::Key, Some(At::handle(1))));
+        };
+        let a = o.public.attributes;
+        if a.restricted() || !a.decrypt() {
+            return Err(Rc::Fmt1(Fmt1::Attributes, Some(At::handle(1))));
+        }
+        // IsLabelProperlyFormatted: empty, or ending in its NUL.
+        if label.last().is_some_and(|b| *b != 0) {
+            return Err(Rc::Fmt1(Fmt1::Value, Some(At::param(3))));
+        }
+        // CryptRsaSelectScheme: the key's scheme wins where the caller names none; where both
+        // name one, they must agree.
+        let keys = match r.parms.scheme {
+            RsaScheme::Null(()) => None,
+            RsaScheme::Rsaes(()) => Some(RsaDecryptScheme::Rsaes(())),
+            RsaScheme::Oaep(h) => Some(RsaDecryptScheme::Oaep(h)),
+            RsaScheme::Rsassa(_) | RsaScheme::Rsapss(_) => {
+                return Err(Rc::Fmt1(Fmt1::Scheme, Some(At::param(2))));
+            }
+        };
+        let scheme = match (keys, scheme) {
+            (None, s) | (Some(s), RsaDecryptScheme::Null(())) => s,
+            (Some(k), s) if k == s => s,
+            _ => return Err(Rc::Fmt1(Fmt1::Scheme, Some(At::param(2)))),
+        };
+        let scheme = match scheme {
+            RsaDecryptScheme::Null(()) => crypto::RsaDecrypt::Raw,
+            RsaDecryptScheme::Rsaes(()) => crypto::RsaDecrypt::Pkcs1,
+            RsaDecryptScheme::Oaep(_) => crypto::RsaDecrypt::Oaep(label),
+        };
+        let m = o
+            .rsa()
+            .expect("an RSA object")
+            .decrypt(&mut crypto::PlatformRng(platform), scheme, c)
+            .map_err(|e| match e {
+                crypto::RsaDecryptError::Size => Rc::Fmt1(Fmt1::Size, None),
+                crypto::RsaDecryptError::Value => Rc::Fmt1(Fmt1::Value, None),
+            })?;
+        let mut out = Writer::new();
+        out.tpm2b(&m);
+        Ok(out)
     }
 
     fn start_auth_session(
@@ -1176,28 +1330,40 @@ impl Tpm<Running> {
         let salt = match tpm_key {
             Some(k) => {
                 let key = self.stage.objects.get(k);
-                let PublicKind::Ecc(ecc) = &key.public.kind else {
-                    return Err(match key.public.kind {
-                        PublicKind::Rsa(_) => Rc::Fmt1(Fmt1::Value, Some(At::param(2))),
-                        _ => Rc::Fmt1(Fmt1::Key, Some(At::handle(1))),
-                    });
-                };
+                if !matches!(key.public.kind, PublicKind::Ecc(_) | PublicKind::Rsa(_)) {
+                    return Err(Rc::Fmt1(Fmt1::Key, Some(At::handle(1))));
+                }
                 if input.encrypted_salt.as_slice().is_empty() {
                     return Err(Rc::Fmt1(Fmt1::Value, Some(At::param(2))));
                 }
                 if !key.public.attributes.decrypt() {
                     return Err(Rc::Fmt1(Fmt1::Attributes, Some(At::handle(1))));
                 }
-                let SensitiveKind::Ecc(private) = &key.sensitive.kind else {
-                    unreachable!("an ECC object holds an ECC private key");
+                // CryptSecretDecrypt; any failure is TPM_RC_VALUE on the salt.
+                let salt = match &key.public.kind {
+                    PublicKind::Ecc(ecc) => ecc_salt(
+                        key.public.name_alg,
+                        &key.ecc().expect("an ECC object"),
+                        &ecc.unique,
+                        input.encrypted_salt.as_slice(),
+                    ),
+                    PublicKind::Rsa(r) => match r.parms.scheme {
+                        // The key's own scheme, OAEP over its nameAlg if it has none.
+                        RsaScheme::Null(()) | RsaScheme::Oaep(_) => key
+                            .rsa()
+                            .expect("an RSA object")
+                            .decrypt(
+                                &mut crypto::PlatformRng(platform),
+                                crypto::RsaDecrypt::Oaep(SECRET_LABEL),
+                                input.encrypted_salt.as_slice(),
+                            )
+                            .ok()
+                            .filter(|s| s.len() <= key.public.name_alg.size()),
+                        _ => None,
+                    },
+                    _ => unreachable!("checked above"),
                 };
-                ecc_salt(
-                    key.public.name_alg,
-                    private.as_slice(),
-                    &ecc.unique,
-                    input.encrypted_salt.as_slice(),
-                )
-                .ok_or(Rc::Fmt1(Fmt1::Value, Some(At::param(2))))?
+                salt.ok_or(Rc::Fmt1(Fmt1::Value, Some(At::param(2))))?
             }
             None => {
                 if !input.encrypted_salt.as_slice().is_empty() {
@@ -1328,12 +1494,50 @@ impl Tpm<Running> {
     }
 }
 
+/// The scheme a signature is made under (`CryptSelectSignScheme`, `CryptIsValidSignScheme`):
+/// the key's own where the caller names NULL, the caller's where the key has none, and where
+/// both name one they must agree; it must also suit the key's type. As `(TPM_ALG_ID, hash)`.
+fn sign_scheme(kind: &PublicKind, asked: SigScheme) -> Option<(u16, Hash)> {
+    use crate::alg::id;
+    let keys = match kind {
+        PublicKind::Rsa(r) => match r.parms.scheme {
+            RsaScheme::Null(()) => None,
+            RsaScheme::Rsassa(h) => Some(SigScheme::Rsassa(h)),
+            RsaScheme::Rsapss(h) => Some(SigScheme::Rsapss(h)),
+            RsaScheme::Rsaes(()) | RsaScheme::Oaep(_) => return None,
+        },
+        PublicKind::Ecc(e) => match e.parms.scheme {
+            EccScheme::Null(()) => None,
+            EccScheme::Ecdsa(h) => Some(SigScheme::Ecdsa(h)),
+            EccScheme::Ecdh(_) => return None,
+        },
+        PublicKind::KeyedHash(k) => match k.scheme {
+            KeyedHashScheme::Null(()) => None,
+            KeyedHashScheme::Hmac(h) => Some(SigScheme::Hmac(h)),
+        },
+        PublicKind::SymCipher(_) => return None,
+    };
+    let scheme = match (keys, asked) {
+        (None, SigScheme::Null(())) => return None,
+        (None, s) | (Some(s), SigScheme::Null(())) => s,
+        (Some(k), s) if k == s => s,
+        _ => return None,
+    };
+    match (kind, scheme) {
+        (PublicKind::Rsa(_), SigScheme::Rsassa(h)) => Some((id::RSASSA, h)),
+        (PublicKind::Rsa(_), SigScheme::Rsapss(h)) => Some((id::RSAPSS, h)),
+        (PublicKind::Ecc(_), SigScheme::Ecdsa(h)) => Some((id::ECDSA, h)),
+        (PublicKind::KeyedHash(_), SigScheme::Hmac(h)) => Some((id::HMAC, h)),
+        _ => None,
+    }
+}
+
 /// The salt of a session salted to an ECC key: the secret is a point `QeU`, and the salt is
 /// `KDFe(nameAlg, (d × QeU).x, "SECRET", QeU.x, key.x, digest bits)`. `None` for a secret that
 /// is not a well-formed point on the curve.
 fn ecc_salt(
     name_alg: Hash,
-    private: &[u8],
+    key: &EccPrivate,
     public: &EccPoint,
     secret: &[u8],
 ) -> Option<zeroize::Zeroizing<Vec<u8>>> {
@@ -1341,7 +1545,6 @@ fn ecc_salt(
     let point = EccPoint::read(&mut r).ok()?;
     r.finish().ok()?;
     let peer = EccPublicKey::from_coordinates(point.x.as_slice(), point.y.as_slice())?;
-    let key = EccPrivate::from_bytes(private).expect("a stored ECC key is a valid scalar");
     let z = key.ecdh(&peer);
     Some(crypto::kdfe(
         name_alg,

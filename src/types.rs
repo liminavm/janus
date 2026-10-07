@@ -129,6 +129,51 @@ wire_union! {
 }
 
 wire_union! {
+    /// `TPMT_SIG_SCHEME+`: the signing schemes janus implements, or NULL for the key's own.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SigScheme: u16 [Fmt1::Scheme] {
+        Null = id::NULL => (),
+        Hmac = id::HMAC => Hash,
+        Rsassa = id::RSASSA => Hash,
+        Rsapss = id::RSAPSS => Hash,
+        Ecdsa = id::ECDSA => Hash,
+    }
+}
+
+wire_union! {
+    /// `TPMT_RSA_DECRYPT+`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RsaDecryptScheme: u16 [Fmt1::Value] {
+        Null = id::NULL => (),
+        Rsaes = id::RSAES => (),
+        Oaep = id::OAEP => Hash,
+    }
+}
+
+/// `TPMT_TK_HASHCHECK` as a command parameter: its tag must be `TPM_ST_HASHCHECK`
+/// (`TPM_RC_TAG`).
+#[derive(Clone, Debug)]
+pub struct HashCheckTicket {
+    pub hierarchy: crate::hierarchy::Hierarchy,
+    pub digest: Digest2b,
+}
+
+/// `TPM_ST_HASHCHECK`.
+pub const ST_HASHCHECK: u16 = 0x8024;
+
+impl Unmarshal for HashCheckTicket {
+    fn read(r: &mut Reader<'_>) -> Result<HashCheckTicket, Fmt1> {
+        if r.u16()? != ST_HASHCHECK {
+            return Err(Fmt1::Tag);
+        }
+        Ok(HashCheckTicket {
+            hierarchy: crate::hierarchy::Hierarchy::read(r)?,
+            digest: Digest2b::read(r)?,
+        })
+    }
+}
+
+wire_union! {
     /// `TPMT_KDF_SCHEME+`. No KDF scheme is implemented.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum KdfScheme: u16 [Fmt1::Kdf] {
@@ -429,5 +474,33 @@ mod tests {
         // AES-256.
         let aes256 = hex("0023000b0003047200000006010000430010000300100000000000");
         assert_eq!(read_prefix::<Public>(&aes256).unwrap_err(), Fmt1::Value);
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// For every input of up to 12 bytes, a hash-check ticket reads only with the
+    /// `TPM_ST_HASHCHECK` tag (`TPM_RC_TAG` otherwise) and a `TPMI_RH_HIERARCHY+` handle, and
+    /// consumes exactly its fields.
+    #[kani::proof]
+    #[kani::unwind(14)]
+    fn a_hash_check_ticket_reads_only_its_tag_and_a_hierarchy() {
+        let data: [u8; 12] = kani::any();
+        let len: usize = kani::any_where(|l| *l <= 12);
+        let mut r = Reader::new(&data[..len]);
+        match HashCheckTicket::read(&mut r) {
+            Ok(t) => {
+                assert!(data[0] == 0x80 && data[1] == 0x24);
+                let h = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+                assert!(t.hierarchy.handle() == h);
+                let n = u16::from_be_bytes([data[6], data[7]]) as usize;
+                assert!(t.digest.as_slice().len() == n);
+                assert!(r.remaining() == len - 8 - n);
+            }
+            Err(Fmt1::Tag) => assert!(len >= 2 && (data[0] != 0x80 || data[1] != 0x24)),
+            Err(_) => {}
+        }
     }
 }

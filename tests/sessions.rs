@@ -690,3 +690,276 @@ fn load_refuses_private_areas_in_the_reference_order() {
     assert_eq!(load(&mut tpm, srk, &private), 0);
     assert_eq!(load(&mut tpm, srk, &private), 0x902, "TPM_RC_OBJECT_MEMORY");
 }
+
+/// tpm2-pkcs11's storage primary (`tests/corpus/06-pkcs11`): RSA-2048, restricted decrypt,
+/// AES-128-CFB for its children.
+const RSA_SRK_TEMPLATE: &str = "0001000b00030072000000060080004300100800000000000000";
+/// ssh-tpm-agent's keys (`tests/corpus/05-ssh-tpm-agent`): unrestricted, sign and decrypt, no
+/// scheme of their own.
+const RSA_KEY_TEMPLATE: &str = "0001000b000600720000001000100800000000000000";
+const ECC_KEY_TEMPLATE: &str = "0023000b000600720000001000100003001000000000";
+/// A restricted ECDSA-SHA256 signing key, as an attestation key is.
+const RESTRICTED_ECC_TEMPLATE: &str = "0023000b00050072000000100018000b0003001000000000";
+
+fn primary(tpm: &mut Janus<Recorder>, hierarchy: u32, template: &str) -> (u32, Vec<u8>) {
+    let params = [&[0, 4, 0, 0, 0, 0][..], &tpm2b(&hex(template)), &[0, 0], &[0, 0, 0, 0]].concat();
+    let rsp = tpm
+        .execute(Locality::ZERO, &command(0x8002, 0x131, &[hierarchy], Some(&pw_area()), &params));
+    assert_eq!(rc(&rsp), 0, "CreatePrimary");
+    let n = u16_at(&rsp, 18) as usize;
+    (u32_at(&rsp, 10), rsp[20..20 + n].to_vec())
+}
+
+/// Creates and loads a key with an empty authValue under `parent`; returns its handle and
+/// public area.
+fn child(tpm: &mut Janus<Recorder>, parent: u32, template: &str) -> (u32, Vec<u8>) {
+    let params =
+        [tpm2b(&[0, 0, 0, 0]), tpm2b(&hex(template)), vec![0, 0], vec![0, 0, 0, 0]].concat();
+    let rsp =
+        tpm.execute(Locality::ZERO, &command(0x8002, 0x153, &[parent], Some(&pw_area()), &params));
+    assert_eq!(rc(&rsp), 0, "Create");
+    let n = u16_at(&rsp, 14) as usize;
+    let private = rsp[16..16 + n].to_vec();
+    let m = u16_at(&rsp, 16 + n) as usize;
+    let public = rsp[18 + n..18 + n + m].to_vec();
+    let params = [tpm2b(&private), tpm2b(&public)].concat();
+    let rsp =
+        tpm.execute(Locality::ZERO, &command(0x8002, 0x157, &[parent], Some(&pw_area()), &params));
+    assert_eq!(rc(&rsp), 0, "Load");
+    (u32_at(&rsp, 10), public)
+}
+
+/// An RSA public area's modulus, its last field.
+fn modulus(public: &[u8]) -> Vec<u8> {
+    let m = &public[public.len() - 256..];
+    assert_eq!(u16_at(public, public.len() - 258), 256);
+    m.to_vec()
+}
+
+fn rsa_public(public: &[u8]) -> rsa::RsaPublicKey {
+    let n = rsa::BoxedUint::from_be_slice(&modulus(public), 2048).unwrap();
+    rsa::RsaPublicKey::new(n, rsa::BoxedUint::from(65537u64)).unwrap()
+}
+
+/// A NULL `TPMT_TK_HASHCHECK`.
+const NULL_TICKET: [u8; 8] = [0x80, 0x24, 0x40, 0x00, 0x00, 0x07, 0x00, 0x00];
+
+/// TPM2_Sign with `key`; returns the response code and the TPMT_SIGNATURE.
+fn sign(
+    tpm: &mut Janus<Recorder>,
+    key: u32,
+    digest: &[u8],
+    scheme: &[u8],
+    ticket: &[u8],
+) -> (u32, Vec<u8>) {
+    let params = [&tpm2b(digest)[..], scheme, ticket].concat();
+    let rsp =
+        tpm.execute(Locality::ZERO, &command(0x8002, 0x15D, &[key], Some(&pw_area()), &params));
+    if rc(&rsp) != 0 {
+        return (rc(&rsp), Vec::new());
+    }
+    let size = u32_at(&rsp, 10) as usize;
+    (0, rsp[14..14 + size].to_vec())
+}
+
+fn rsa_decrypt(
+    tpm: &mut Janus<Recorder>,
+    key: u32,
+    c: &[u8],
+    scheme: &[u8],
+    label: &[u8],
+) -> (u32, Vec<u8>) {
+    let params = [&tpm2b(c)[..], scheme, &tpm2b(label)].concat();
+    let rsp =
+        tpm.execute(Locality::ZERO, &command(0x8002, 0x159, &[key], Some(&pw_area()), &params));
+    if rc(&rsp) != 0 {
+        return (rc(&rsp), Vec::new());
+    }
+    (0, rsp[16..16 + u16_at(&rsp, 14) as usize].to_vec())
+}
+
+#[test]
+fn an_rsa_storage_key_is_the_same_key_every_time_and_parents_keys() {
+    let (mut tpm, _) = started();
+    let (srk, public) = primary(&mut tpm, RH_OWNER, RSA_SRK_TEMPLATE);
+    let n = modulus(&public);
+    assert!(n[0] >= 0x80, "a 2048-bit modulus");
+    // Derived again from the same seed and template: the same key.
+    let flush = command(0x8001, 0x165, &[], None, &srk.to_be_bytes());
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &flush)), 0);
+    let (srk, again) = primary(&mut tpm, RH_OWNER, RSA_SRK_TEMPLATE);
+    assert_eq!(again, public, "a primary key is a function of its seed and template");
+    // In another hierarchy, another key.
+    let (other, endorsement) = primary(&mut tpm, 0x4000_000B, RSA_SRK_TEMPLATE);
+    assert_ne!(modulus(&endorsement), n);
+    let flush = command(0x8001, 0x165, &[], None, &other.to_be_bytes());
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &flush)), 0);
+
+    // An RSA key under it signs, PKCS#1 v1.5 and PSS, and the signatures verify.
+    let (key, key_public) = child(&mut tpm, srk, RSA_KEY_TEMPLATE);
+    let verifier = rsa_public(&key_public);
+    let digest = sha256(&[b"to be signed"]);
+    let (code, sig) = sign(&mut tpm, key, &digest, &[0x00, 0x14, 0x00, 0x0B], &NULL_TICKET);
+    assert_eq!(code, 0, "RSASSA");
+    assert_eq!(sig[..6], [0x00, 0x14, 0x00, 0x0B, 0x01, 0x00]);
+    verifier
+        .verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &digest, &sig[6..])
+        .expect("RSASSA verifies");
+    let (code, sig) = sign(&mut tpm, key, &digest, &[0x00, 0x16, 0x00, 0x0B], &NULL_TICKET);
+    assert_eq!(code, 0, "RSAPSS");
+    verifier.verify(rsa::Pss::<Sha256>::new(), &digest, &sig[6..]).expect("RSAPSS verifies");
+    // A key with no scheme of its own needs the caller's: TPM_RC_SCHEME on it.
+    assert_eq!(sign(&mut tpm, key, &digest, &[0x00, 0x10], &NULL_TICKET).0, 0x2D2);
+    // A digest of the wrong size: TPM_RC_SIZE on it.
+    assert_eq!(
+        sign(&mut tpm, key, &digest[..31], &[0x00, 0x14, 0x00, 0x0B], &NULL_TICKET).0,
+        0x1D5
+    );
+
+    // It decrypts what was encrypted to it: OAEP with a label, and PKCS#1 v1.5.
+    let mut rng = Rng(0);
+    let secret = b"a symmetric key";
+    let c = verifier
+        .encrypt(&mut rng, rsa::Oaep::<Sha256>::new_with_label(&b"label\0"[..]), secret)
+        .unwrap();
+    assert_eq!(
+        rsa_decrypt(&mut tpm, key, &c, &[0x00, 0x17, 0x00, 0x0B], b"label\0"),
+        (0, secret.to_vec())
+    );
+    // Under another label, nothing: TPM_RC_VALUE.
+    assert_eq!(rsa_decrypt(&mut tpm, key, &c, &[0x00, 0x17, 0x00, 0x0B], b"lapel\0").0, 0x084);
+    // A label without its NUL: TPM_RC_VALUE on the label.
+    assert_eq!(rsa_decrypt(&mut tpm, key, &c, &[0x00, 0x17, 0x00, 0x0B], b"label").0, 0x3C4);
+    let c = verifier.encrypt(&mut rng, rsa::Pkcs1v15Encrypt, secret).unwrap();
+    assert_eq!(rsa_decrypt(&mut tpm, key, &c, &[0x00, 0x15], &[]), (0, secret.to_vec()));
+    // A ciphertext the modulus' size but not below it: TPM_RC_SIZE.
+    assert_eq!(rsa_decrypt(&mut tpm, key, &[0xFF; 256], &[0x00, 0x15], &[]).0, 0x095);
+    // The storage key does not sign: TPM_RC_KEY on its handle.
+    assert_eq!(sign(&mut tpm, srk, &digest, &[0x00, 0x14, 0x00, 0x0B], &NULL_TICKET).0, 0x19C);
+    // The storage key is restricted: TPM_RC_ATTRIBUTES on its handle.
+    assert_eq!(rsa_decrypt(&mut tpm, srk, &c, &[0x00, 0x15], &[]).0, 0x182);
+}
+
+#[test]
+fn ecc_keys_sign_and_restricted_ones_only_what_the_tpm_hashed() {
+    let (mut tpm, _) = started();
+    let (srk, _) = primary(&mut tpm, RH_OWNER, KERNEL_TEMPLATE);
+    let (key, public) = child(&mut tpm, srk, ECC_KEY_TEMPLATE);
+    let point =
+        [&[4u8][..], &public[public.len() - 66..public.len() - 34], &public[public.len() - 32..]]
+            .concat();
+    let verifier = p256::ecdsa::VerifyingKey::from_sec1_bytes(&point).unwrap();
+    let digest = sha256(&[b"to be signed"]);
+    let (code, sig) = sign(&mut tpm, key, &digest, &[0x00, 0x18, 0x00, 0x0B], &NULL_TICKET);
+    assert_eq!(code, 0, "ECDSA");
+    assert_eq!(sig[..4], [0x00, 0x18, 0x00, 0x0B]);
+    let r = &sig[6..6 + u16_at(&sig, 4) as usize];
+    let s = &sig[8 + r.len()..];
+    let sig = p256::ecdsa::Signature::from_scalars(
+        <[u8; 32]>::try_from(r).unwrap(),
+        <[u8; 32]>::try_from(s).unwrap(),
+    )
+    .unwrap();
+    use p256::ecdsa::signature::hazmat::PrehashVerifier;
+    verifier.verify_prehash(&digest, &sig).expect("ECDSA verifies");
+    // An ECC key does not do RSA's schemes: TPM_RC_SCHEME on the scheme.
+    assert_eq!(sign(&mut tpm, key, &digest, &[0x00, 0x14, 0x00, 0x0B], &NULL_TICKET).0, 0x2D2);
+
+    let flush = command(0x8001, 0x165, &[], None, &key.to_be_bytes());
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &flush)), 0);
+    let (ak, _) = child(&mut tpm, srk, RESTRICTED_ECC_TEMPLATE);
+    // A restricted key signs only a digest the TPM made, with the ticket to prove it:
+    // TPM_RC_TICKET on the validation without one.
+    assert_eq!(sign(&mut tpm, ak, &digest, &[0x00, 0x10], &NULL_TICKET).0, 0x3E0);
+    let hash = |tpm: &mut Janus<Recorder>, data: &[u8]| {
+        let params = [tpm2b(data), vec![0, 0x0B], RH_OWNER.to_be_bytes().to_vec()].concat();
+        let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x17D, &[], None, &params));
+        assert_eq!(rc(&rsp), 0);
+        (rsp[12..44].to_vec(), rsp[44..].to_vec())
+    };
+    let (d, ticket) = hash(&mut tpm, b"to be signed");
+    assert_eq!(d, digest);
+    assert_eq!(sign(&mut tpm, ak, &d, &[0x00, 0x10], &ticket).0, 0);
+    // The ticket is for that digest only.
+    let other = sha256(&[b"something else"]);
+    assert_eq!(sign(&mut tpm, ak, &other, &[0x00, 0x10], &ticket).0, 0x3E0);
+    // Data that starts like an attestation gets no ticket, so it cannot be signed.
+    let (d, ticket) = hash(&mut tpm, b"\xffTCG forged quote");
+    assert_eq!(sign(&mut tpm, ak, &d, &[0x00, 0x10], &ticket).0, 0x3E0);
+}
+
+/// Randomness for the test's own encryptions.
+struct Rng(u8);
+
+impl rand_core::TryRng for Rng {
+    type Error = core::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut b = [0; 4];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut b = [0; 8];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        for b in dst {
+            self.0 = self.0.wrapping_mul(31).wrapping_add(7);
+            *b = self.0;
+        }
+        Ok(())
+    }
+}
+
+impl rand_core::TryCryptoRng for Rng {}
+
+#[test]
+fn a_session_salted_to_an_rsa_key_derives_the_key_the_client_does() {
+    let (mut tpm, _) = started();
+    let (srk, public) = primary(&mut tpm, RH_OWNER, RSA_SRK_TEMPLATE);
+    let salt = [0x5A; 32];
+    let encrypted = rsa_public(&public)
+        .encrypt(&mut Rng(1), rsa::Oaep::<Sha256>::new_with_label(&b"SECRET\0"[..]), &salt)
+        .unwrap();
+    let nonce_caller = vec![0xC3; 32];
+    let params = [
+        tpm2b(&nonce_caller),
+        tpm2b(&encrypted),
+        vec![0x00],
+        AES_128_CFB.to_vec(),
+        SHA256.to_be_bytes().to_vec(),
+    ]
+    .concat();
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x176, &[srk, RH_NULL], None, &params));
+    assert_eq!(rc(&rsp), 0, "StartAuthSession");
+    let n = u16_at(&rsp, 14) as usize;
+    let nonce_tpm = rsp[16..16 + n].to_vec();
+    let key = kdfa(&salt, "ATH", &nonce_tpm, &nonce_caller, 256);
+    let mut s = Session { handle: u32_at(&rsp, 10), key, nonce_caller, nonce_tpm };
+
+    // GetRandom under it: the response HMAC verifies under the key derived from the salt.
+    let params = 16u16.to_be_bytes();
+    let cp = sha256(&[&0x17Bu32.to_be_bytes(), &params]);
+    let area = s.entry(&cp, CONTINUE | ENCRYPT, &[]);
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8002, 0x17B, &[], Some(&area), &params));
+    assert_eq!(rc(&rsp), 0, "GetRandom");
+    let size = u32_at(&rsp, 10) as usize;
+    let rp = sha256(&[&0u32.to_be_bytes(), &0x17Bu32.to_be_bytes(), &rsp[14..14 + size]]);
+    s.check(&rp, CONTINUE | ENCRYPT, &[], &rsp[14 + size..]);
+
+    // A salt encrypted under another label does not decrypt: TPM_RC_VALUE on the salt.
+    let wrong = rsa_public(&public)
+        .encrypt(&mut Rng(2), rsa::Oaep::<Sha256>::new_with_label(&b"SECRET"[..]), &salt)
+        .unwrap();
+    let params = [
+        tpm2b(&[0xC3; 32]),
+        tpm2b(&wrong),
+        vec![0x00],
+        AES_128_CFB.to_vec(),
+        SHA256.to_be_bytes().to_vec(),
+    ]
+    .concat();
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x176, &[srk, RH_NULL], None, &params));
+    assert_eq!(rc(&rsp), 0x2C4);
+}

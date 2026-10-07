@@ -963,3 +963,97 @@ fn a_session_salted_to_an_rsa_key_derives_the_key_the_client_does() {
     let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x176, &[srk, RH_NULL], None, &params));
     assert_eq!(rc(&rsp), 0x2C4);
 }
+
+/// A password session whose password is `pw`.
+fn pw(pw: &[u8]) -> Vec<u8> {
+    [&RS_PW.to_be_bytes()[..], &[0, 0, 0], &tpm2b(pw)].concat()
+}
+
+fn sequence_update(tpm: &mut Janus<Recorder>, seq: u32, auth: &[u8], data: &[u8]) -> u32 {
+    rc(&tpm.execute(Locality::ZERO, &command(0x8002, 0x15C, &[seq], Some(&pw(auth)), &tpm2b(data))))
+}
+
+/// TPM2_SequenceComplete; returns the code, the digest and the ticket.
+fn sequence_complete(
+    tpm: &mut Janus<Recorder>,
+    seq: u32,
+    auth: &[u8],
+    data: &[u8],
+) -> (u32, Vec<u8>, Vec<u8>) {
+    let params = [tpm2b(data), RH_OWNER.to_be_bytes().to_vec()].concat();
+    let rsp =
+        tpm.execute(Locality::ZERO, &command(0x8002, 0x13E, &[seq], Some(&pw(auth)), &params));
+    if rc(&rsp) != 0 {
+        return (rc(&rsp), Vec::new(), Vec::new());
+    }
+    let size = u32_at(&rsp, 10) as usize;
+    let out = &rsp[14..14 + size];
+    (0, out[2..34].to_vec(), out[34..].to_vec())
+}
+
+fn start_sequence(tpm: &mut Janus<Recorder>, auth: &[u8], alg: u16) -> u32 {
+    let params = [tpm2b(auth), alg.to_be_bytes().to_vec()].concat();
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x186, &[], None, &params));
+    assert_eq!(rc(&rsp), 0, "HashSequenceStart");
+    u32_at(&rsp, 10)
+}
+
+#[test]
+fn a_hash_sequence_survives_its_context_and_tickets_what_a_restricted_key_signs() {
+    let (mut tpm, _) = started();
+    let (srk, _) = primary(&mut tpm, RH_OWNER, KERNEL_TEMPLATE);
+    let (ak, _) = child(&mut tpm, srk, RESTRICTED_ECC_TEMPLATE);
+    let flush = command(0x8001, 0x165, &[], None, &srk.to_be_bytes());
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &flush)), 0);
+
+    let message: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+    let seq = start_sequence(&mut tpm, b"seq", 0x000B);
+    assert_eq!(sequence_update(&mut tpm, seq, b"seq", &message[..70]), 0);
+    // A resource manager saves the sequence between commands and loads it back.
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x162, &[seq], None, &[]));
+    assert_eq!(rc(&rsp), 0, "ContextSave");
+    let context = rsp[10..].to_vec();
+    assert_eq!(
+        rc(&tpm.execute(Locality::ZERO, &command(0x8001, 0x165, &[], None, &seq.to_be_bytes()))),
+        0
+    );
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x161, &[], None, &context));
+    assert_eq!(rc(&rsp), 0, "ContextLoad");
+    let seq = u32_at(&rsp, 10);
+    // Its authValue came back with it; a wrong one is BAD_AUTH, and a sequence is exempt
+    // from dictionary-attack protection, so it does not count.
+    assert_eq!(sequence_update(&mut tpm, seq, b"sex", &message[70..150]), 0x9A2);
+    assert_eq!(sequence_update(&mut tpm, seq, b"seq", &message[70..150]), 0);
+    let (code, digest, ticket) = sequence_complete(&mut tpm, seq, b"seq", &message[150..]);
+    assert_eq!(code, 0, "SequenceComplete");
+    assert_eq!(digest, sha256(&[&message]));
+    assert_eq!(ticket[..6], [0x80, 0x24, 0x40, 0x00, 0x00, 0x01], "an owner hierarchy ticket");
+    // The restricted key signs the digest with that ticket.
+    assert_eq!(sign(&mut tpm, ak, &digest, &[0x00, 0x10], &ticket).0, 0);
+    // SequenceComplete flushed the sequence.
+    assert_eq!(sequence_update(&mut tpm, seq, b"seq", b"more"), 0x910);
+
+    // A first block too short to tell whether it starts like an attestation: no ticket.
+    let seq = start_sequence(&mut tpm, b"", 0x000B);
+    assert_eq!(sequence_update(&mut tpm, seq, b"", b"\xffTC"), 0);
+    let (_, digest, ticket) = sequence_complete(&mut tpm, seq, b"", b"G quote");
+    assert_eq!(digest, sha256(&[b"\xffTCG quote"]));
+    assert_eq!(ticket, NULL_TICKET.to_vec());
+    // With no update, the final block decides.
+    let seq = start_sequence(&mut tpm, b"", 0x000B);
+    assert_eq!(sequence_complete(&mut tpm, seq, b"", b"\xffTCG quote").2, NULL_TICKET.to_vec());
+
+    // A key is not a sequence: TPM_RC_MODE on the handle, after it authorized.
+    assert_eq!(sequence_update(&mut tpm, ak, b"", b"data"), 0x189);
+    // An event sequence updates, but only EventSequenceComplete ends it: TPM_RC_MODE.
+    let event = start_sequence(&mut tpm, b"", 0x0010);
+    assert_eq!(sequence_update(&mut tpm, event, b"", b"data"), 0);
+    assert_eq!(sequence_complete(&mut tpm, event, b"", b"").0, 0x189);
+    // A sequence is not a key: TPM_RC_SEQUENCE.
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x173, &[event], None, &[]));
+    assert_eq!(rc(&rsp), 0x103);
+    // No hash janus does not implement: TPM_RC_HASH on the algorithm.
+    let params = [tpm2b(b""), 0x000Cu16.to_be_bytes().to_vec()].concat();
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x186, &[], None, &params));
+    assert_eq!(rc(&rsp), 0x2C3);
+}

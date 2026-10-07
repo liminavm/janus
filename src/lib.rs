@@ -25,6 +25,7 @@ mod hierarchy;
 mod object;
 mod pcr;
 pub mod rc;
+mod sequence;
 mod session;
 mod tpm;
 mod types;

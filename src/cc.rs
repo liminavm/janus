@@ -7,12 +7,14 @@
 pub enum Cc {
     HierarchyChangeAuth,
     CreatePrimary,
+    SequenceComplete,
     SelfTest,
     Startup,
     Shutdown,
     Create,
     Load,
     RsaDecrypt,
+    SequenceUpdate,
     Sign,
     Unseal,
     ContextLoad,
@@ -30,21 +32,24 @@ pub enum Cc {
     PolicyPcr,
     PolicyRestart,
     PcrExtend,
+    HashSequenceStart,
     PolicyGetDigest,
     TestParms,
     PolicyPassword,
 }
 
 /// The implemented commands in `TPM_CC` order, which is the order `TPM_CAP_COMMANDS` lists them.
-pub const IMPLEMENTED: [Cc; 28] = [
+pub const IMPLEMENTED: [Cc; 31] = [
     Cc::HierarchyChangeAuth,
     Cc::CreatePrimary,
+    Cc::SequenceComplete,
     Cc::SelfTest,
     Cc::Startup,
     Cc::Shutdown,
     Cc::Create,
     Cc::Load,
     Cc::RsaDecrypt,
+    Cc::SequenceUpdate,
     Cc::Sign,
     Cc::Unseal,
     Cc::ContextLoad,
@@ -62,6 +67,7 @@ pub const IMPLEMENTED: [Cc; 28] = [
     Cc::PolicyPcr,
     Cc::PolicyRestart,
     Cc::PcrExtend,
+    Cc::HashSequenceStart,
     Cc::PolicyGetDigest,
     Cc::TestParms,
     Cc::PolicyPassword,
@@ -105,12 +111,14 @@ impl Cc {
         match self {
             Cc::HierarchyChangeAuth => 0x129,
             Cc::CreatePrimary => 0x131,
+            Cc::SequenceComplete => 0x13E,
             Cc::SelfTest => 0x143,
             Cc::Startup => 0x144,
             Cc::Shutdown => 0x145,
             Cc::Create => 0x153,
             Cc::Load => 0x157,
             Cc::RsaDecrypt => 0x159,
+            Cc::SequenceUpdate => 0x15C,
             Cc::Sign => 0x15D,
             Cc::Unseal => 0x15E,
             Cc::ContextLoad => 0x161,
@@ -128,6 +136,7 @@ impl Cc {
             Cc::PolicyPcr => 0x17F,
             Cc::PolicyRestart => 0x180,
             Cc::PcrExtend => 0x182,
+            Cc::HashSequenceStart => 0x186,
             Cc::PolicyGetDigest => 0x189,
             Cc::TestParms => 0x18A,
             Cc::PolicyPassword => 0x18C,
@@ -179,7 +188,18 @@ impl Cc {
             Cc::RsaDecrypt => {
                 Attributes { handles: 1, auth_handles: 1, decrypt: true, encrypt: true, ..NONE }
             }
-            Cc::Sign => Attributes { handles: 1, auth_handles: 1, decrypt: true, ..NONE },
+            Cc::Sign | Cc::SequenceUpdate => {
+                Attributes { handles: 1, auth_handles: 1, decrypt: true, ..NONE }
+            }
+            Cc::SequenceComplete => Attributes {
+                flushed: true,
+                handles: 1,
+                auth_handles: 1,
+                decrypt: true,
+                encrypt: true,
+                ..NONE
+            },
+            Cc::HashSequenceStart => Attributes { response_handle: true, decrypt: true, ..NONE },
             Cc::Unseal => Attributes { handles: 1, auth_handles: 1, encrypt: true, ..NONE },
             Cc::PolicyPcr => Attributes { handles: 1, decrypt: true, ..NONE },
             Cc::PolicyAuthValue

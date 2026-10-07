@@ -30,9 +30,10 @@ use crate::handle::{
 };
 use crate::hierarchy::{Hierarchy, NullSecrets, PersistentSecrets, Secrets};
 use crate::marshal::{List, Marshal, Tpm2b, Unmarshal};
-use crate::object::{self, Loaded, Object, Objects, SensitiveKind};
+use crate::object::{self, Loaded, Object, Objects, SensitiveKind, SequenceSlot};
 use crate::pcr::{self, Pcrs, Selection};
 use crate::rc::{At, Fmt0, Fmt1, Rc, Slot, Warn};
+use crate::sequence::{self, HashSequence};
 use crate::session::{
     self, AuthValue, Authorization, Authorized, Da, Entity, EntityAuth, Lockout, Session,
     SessionTable, SessionType,
@@ -51,7 +52,9 @@ struct Persistent {
     endorsement_auth: AuthValue,
     lockout_auth: AuthValue,
     secrets: PersistentSecrets,
-    /// TPM Resets since manufacture (`totalResetCount`). Saved contexts are bound to it.
+    /// TPM Resets since manufacture (`totalResetCount`). Saved contexts are bound to it. With no
+    /// `TPM2_Clear` it is also the resets since the last Clear (`resetCount`), which
+    /// `TPMS_CLOCK_INFO` reports.
     reset_count: u64,
     /// The last `TPM2_Shutdown`, until a Startup takes it or a command makes it stale.
     orderly: Option<Orderly>,
@@ -285,6 +288,7 @@ impl Entity for PcrOrNull {}
 impl Entity for HierarchyAuth {}
 impl Entity for Hierarchy {}
 impl Entity for Loaded {}
+impl Entity for SequenceSlot {}
 
 /// A handle's name for the cpHash: an object's is its name, everything else's is its handle.
 fn handle_name(h: u32) -> Name2b {
@@ -752,6 +756,56 @@ impl Tpm<Running> {
                 };
                 (None, out, auth)
             }
+            Cc::HashSequenceStart => {
+                let mut auth = self.read_auth(&mut cmd, Vec::new())?;
+                let raw = cmd.params();
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let mut r = Reader::new(&params);
+                let value = crate::types::Secret::<MAX_DIGEST>::read(&mut r).at(At::param(1))?;
+                // TPMI_ALG_HASH+: NULL starts an event sequence.
+                let alg = r.u16().at(At::param(2))?;
+                let event = alg == crate::alg::id::NULL;
+                if !event {
+                    Hash::from_id(alg).ok_or(Fmt1::Hash).at(At::param(2))?;
+                }
+                r.finish().map_err(Rc::bare)?;
+                let q = HashSequence::new(value, event);
+                let s = self.stage.objects.insert_sequence(q).ok_or(Warn::ObjectMemory)?;
+                (Some(s.handle()), Writer::new(), auth)
+            }
+            Cc::SequenceUpdate | Cc::SequenceComplete => {
+                let [h] = cmd.handles()?;
+                let target = self.sequence_handle(h)?;
+                let name = match target {
+                    Ok(_) => Buf::empty(),
+                    Err(l) => self.name_of_object(Some(l)),
+                };
+                let mut auth = self.read_auth(&mut cmd, vec![name])?;
+                let raw = cmd.params();
+                let target = match target {
+                    Ok(q) => Ok(self.authorize_sequence(&mut auth, raw, q)?.entity()),
+                    Err(l) => Err(self.authorize_object(&mut auth, raw, l)?.entity()),
+                };
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let mut r = Reader::new(&params);
+                let data = Buf::<MAX_BUFFER>::read(&mut r).at(At::param(1))?;
+                let hierarchy = if cc == Cc::SequenceComplete {
+                    Some(Hierarchy::read(&mut r).at(At::param(2))?)
+                } else {
+                    None
+                };
+                r.finish().map_err(Rc::bare)?;
+                // A key where a sequence belongs: TPM_RC_MODE on the handle.
+                let q = target.map_err(|_| Rc::Fmt1(Fmt1::Mode, Some(At::handle(1))))?;
+                let out = match hierarchy {
+                    None => {
+                        self.stage.objects.sequence_mut(q).update(data.as_slice());
+                        Writer::new()
+                    }
+                    Some(hierarchy) => self.sequence_complete(q, data.as_slice(), hierarchy)?,
+                };
+                (None, out, auth)
+            }
         };
         debug_assert_eq!(handle.is_some(), attributes.response_handle, "{cc:?}");
         let (params, area) = auth.respond(&mut self.stage.reset.sessions, platform, out.into_vec());
@@ -806,9 +860,15 @@ impl Tpm<Running> {
         let slot = Slot::new(n - 1).expect("at most seven handles");
         match o {
             ObjectHandle::Null => Ok(None),
-            ObjectHandle::Transient(h) => {
-                self.stage.objects.find(h).map(Some).ok_or(Warn::ReferenceH(slot).into())
-            }
+            ObjectHandle::Transient(h) => match self.stage.objects.find(h) {
+                Some(l) => Ok(Some(l)),
+                // A running hash sequence where a key belongs. The reference lets each command
+                // find this out for itself after authorization, with its own code
+                // (TPM_RC_SEQUENCE from ReadPublic, KEY or TYPE from most others); janus
+                // answers TPM_RC_SEQUENCE for all of them, before authorization.
+                None if self.stage.objects.find_sequence(h).is_some() => Err(Fmt0::Sequence.into()),
+                None => Err(Warn::ReferenceH(slot).into()),
+            },
             ObjectHandle::Persistent(_) => Err(Rc::Fmt1(Fmt1::Handle, Some(At::handle(n)))),
         }
     }
@@ -828,7 +888,7 @@ impl Tpm<Running> {
     fn resolve_context(&self, c: ContextHandle) -> Result<ContextHandle, Rc> {
         let slot = Slot::new(0).expect("slot 0");
         let present = match c {
-            ContextHandle::Transient(h) => self.stage.objects.find(h).is_some(),
+            ContextHandle::Transient(h) => self.stage.objects.is_occupied(h),
             ContextHandle::Session(h) => self.stage.reset.sessions.get(h).is_some(),
         };
         if present { Ok(c) } else { Err(Warn::ReferenceH(slot).into()) }
@@ -1068,6 +1128,77 @@ impl Tpm<Running> {
         let mut out = Writer::new();
         name.write(&mut out);
         Ok((loaded.handle(), out))
+    }
+
+    /// The handle of `TPM2_SequenceUpdate` and `TPM2_SequenceComplete`, a `TPMI_DH_OBJECT`:
+    /// a running sequence, or a key, which authorizes as itself and is then refused.
+    fn sequence_handle(&self, h: u32) -> Result<Result<SequenceSlot, Loaded>, Rc> {
+        let o = ObjectHandle::from_handle(h, false).ok_or(Fmt1::Value).at(At::handle(1))?;
+        if let ObjectHandle::Transient(t) = o
+            && let Some(q) = self.stage.objects.find_sequence(t)
+        {
+            return Ok(Ok(q));
+        }
+        Ok(Err(self.resolve_object(o, 1)?.expect("not NULL")))
+    }
+
+    /// A sequence's authorization: its authValue is always available, a policy never is, and
+    /// it is exempt from dictionary-attack protection (`AllocateSequenceSlot` sets noDA).
+    fn authorize_sequence(
+        &mut self,
+        auth: &mut Authorization,
+        params: &[u8],
+        q: SequenceSlot,
+    ) -> Result<Authorized<SequenceSlot>, Rc> {
+        let value = AuthValue::from_slice(self.stage.objects.sequence(q).auth.as_slice());
+        let entity = EntityAuth {
+            name: &[],
+            value: &value,
+            policy: &[],
+            da: Da::Exempt,
+            value_available: true,
+        };
+        auth.authorize(
+            &self.stage.reset.sessions,
+            params,
+            q,
+            &entity,
+            &mut self.lockout,
+            self.stage.pcrs.counter(),
+        )
+    }
+
+    /// `TPM2_SequenceComplete`: the digest, a hash-check ticket when the data may be ticketed,
+    /// and the sequence flushed.
+    fn sequence_complete(
+        &mut self,
+        q: SequenceSlot,
+        data: &[u8],
+        hierarchy: Hierarchy,
+    ) -> Result<Writer, Rc> {
+        let sequence::Kind::Hash { first_block, ticket_safe } = self.stage.objects.sequence(q).kind
+        else {
+            return Err(Rc::Fmt1(Fmt1::Mode, Some(At::handle(1))));
+        };
+        let Some(object::Occupant::Sequence(mut done)) = self.stage.objects.remove(q.handle())
+        else {
+            unreachable!("q names a sequence");
+        };
+        done.state.update(data);
+        let safe = if first_block { ticket_safe } else { sequence::ticket_safe_data(data) };
+        let digest = std::mem::take(&mut done.state).finish();
+        let mut out = Writer::new();
+        out.tpm2b(&digest);
+        let ticket = if hierarchy == Hierarchy::Null || !safe {
+            HashCheck { hierarchy: crate::handle::rh::NULL, digest: Vec::new() }
+        } else {
+            HashCheck {
+                hierarchy: hierarchy.handle(),
+                digest: self.hash_check_hmac(hierarchy, Hash::Sha256, &digest).to_vec(),
+            }
+        };
+        ticket.write(&mut out);
+        Ok(out)
     }
 
     /// A `TPMI_SH_POLICY` handle: `TPM_RC_VALUE` for another handle type,
@@ -1416,24 +1547,43 @@ impl Tpm<Running> {
     fn context_save(&mut self, target: ContextHandle, h: u32) -> Result<Writer, Rc> {
         let (context, clear_orderly) = match target {
             ContextHandle::Transient(_) => {
-                let l = self.stage.objects.find(h).expect("resolved");
                 let sequence =
                     self.stage.reset.object_sequence.checked_add(1).ok_or(Fmt0::TooManyContexts)?;
                 self.stage.reset.object_sequence = sequence;
-                let o = self.stage.objects.get(l);
-                let saved_handle = if o.public.attributes.st_clear() {
-                    SavedHandle::StClear
+                let context = if let Some(l) = self.stage.objects.find(h) {
+                    let o = self.stage.objects.get(l);
+                    let saved_handle = if o.public.attributes.st_clear() {
+                        SavedHandle::StClear
+                    } else {
+                        SavedHandle::Object
+                    };
+                    let blob = context::seal(
+                        self.secrets().proof(o.hierarchy),
+                        &self.epoch(),
+                        sequence,
+                        saved_handle,
+                        o,
+                    );
+                    Context { sequence, saved_handle, hierarchy: o.hierarchy, blob }
                 } else {
-                    SavedHandle::Object
+                    // A sequence belongs to no hierarchy; its context is sealed under the NULL
+                    // hierarchy's proof, so it does not outlive a TPM Reset.
+                    let q = self.stage.objects.find_sequence(h).expect("resolved");
+                    let blob = context::seal(
+                        self.secrets().proof(Hierarchy::Null),
+                        &self.epoch(),
+                        sequence,
+                        SavedHandle::Sequence,
+                        self.stage.objects.sequence(q),
+                    );
+                    Context {
+                        sequence,
+                        saved_handle: SavedHandle::Sequence,
+                        hierarchy: Hierarchy::Null,
+                        blob,
+                    }
                 };
-                let blob = context::seal(
-                    self.secrets().proof(o.hierarchy),
-                    &self.epoch(),
-                    sequence,
-                    saved_handle,
-                    o,
-                );
-                (Context { sequence, saved_handle, hierarchy: o.hierarchy, blob }, true)
+                (context, true)
             }
             ContextHandle::Session(h) => {
                 let (sequence, session) = self.stage.reset.sessions.save(h)?;
@@ -1466,8 +1616,11 @@ impl Tpm<Running> {
                 let l = self.stage.objects.insert(o).ok_or(Warn::ObjectMemory)?;
                 Ok(l.handle())
             }
-            // janus saves no sequence objects, so no context of one can carry its HMAC.
-            SavedHandle::Sequence => Err(Rc::Fmt1(Fmt1::Integrity, Some(at))),
+            SavedHandle::Sequence => {
+                let q: HashSequence = context::open(proof, &epoch, &context).at(at)?;
+                let l = self.stage.objects.insert_sequence(q).ok_or(Warn::ObjectMemory)?;
+                Ok(l.handle())
+            }
             SavedHandle::Session(h) => {
                 let s: Session = context::open(proof, &epoch, &context).at(at)?;
                 self.persistent.orderly = None;
@@ -1481,8 +1634,7 @@ impl Tpm<Running> {
         let refused = Rc::Fmt1(Fmt1::Handle, Some(At::param(1)));
         match target {
             ContextHandle::Transient(h) => {
-                let l = self.stage.objects.find(h).ok_or(refused)?;
-                self.stage.objects.remove(l);
+                self.stage.objects.remove(h).ok_or(refused)?;
             }
             ContextHandle::Session(h) => {
                 if !self.stage.reset.sessions.flush(h) {

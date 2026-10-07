@@ -310,6 +310,27 @@ SABOTAGES = [
         "if r.u16()? == 0 {",
         "kani:a_hash_check_ticket_reads_only_its_tag_and_a_hierarchy",
     ),
+    (
+        "a sequence tickets data whose first block starts like an attestation",
+        "src/sequence.rs",
+        "*ticket_safe = ticket_safe_data(data);",
+        "*ticket_safe = true;",
+        "a_hash_sequence_survives_its_context_and_tickets_what_a_restricted_key_signs",
+    ),
+    (
+        "a saved hash state may claim any pending length",
+        "src/sequence.rs",
+        "if pending.get().len() as u64 != len % 64 {",
+        "if false && pending.get().len() as u64 != len % 64 {",
+        "kani:a_hash_state_reads_only_a_state_a_hash_could_reach",
+    ),
+    (
+        "a sequence's wrong password counts toward lockout",
+        "src/tpm.rs",
+        "            da: Da::Exempt,\n            value_available: true,\n        };\n        auth.authorize(\n            &self.stage.reset.sessions,\n            params,\n            q,",
+        "            da: Da::Protected,\n            value_available: true,\n        };\n        auth.authorize(\n            &self.stage.reset.sessions,\n            params,\n            q,",
+        "a_hash_sequence_survives_its_context_and_tickets_what_a_restricted_key_signs",
+    ),
 ]
 
 

@@ -9,6 +9,7 @@ use crate::handle::{handle_type, ht};
 use crate::hierarchy::Hierarchy;
 use crate::marshal::{Marshal, Tpm2b, Unmarshal};
 use crate::rc::{At, Fmt0, Fmt1, Rc};
+use crate::sequence::HashSequence;
 use crate::types::{
     EccPoint, EccScheme, KeyedHashScheme, MAX_ECC_KEY_BYTES, MAX_SYM_DATA, Name2b, Public,
     PublicKind, RsaScheme, Secret, SensitiveCreate, SymDefObject, SymObject,
@@ -623,14 +624,20 @@ pub const MAX_LOADED_OBJECTS: usize = 3;
 /// The first transient handle (`TRANSIENT_FIRST`).
 pub const TRANSIENT_FIRST: u32 = 0x8000_0000;
 
+/// What a transient object slot holds: a key or sealed data, or a running hash sequence.
+pub enum Occupant {
+    Key(Box<Object>),
+    Sequence(Box<HashSequence>),
+}
+
 /// Loaded transient objects, by slot. A slot's handle is `TRANSIENT_FIRST + slot`.
 #[derive(Default)]
 pub struct Objects {
-    slots: [Option<Box<Object>>; MAX_LOADED_OBJECTS],
+    slots: [Option<Occupant>; MAX_LOADED_OBJECTS],
 }
 
-/// A handle of a loaded transient object. Only [`Objects`] makes one, by finding the object,
-/// so a handler holding one knows the object was there when the command started.
+/// A handle of a loaded key or sealed object. Only [`Objects`] makes one, by finding such an
+/// object, so a handler holding one knows the object was there when the command started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Loaded(usize);
 
@@ -640,38 +647,90 @@ impl Loaded {
     }
 }
 
+/// A handle of a running hash sequence, likewise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SequenceSlot(usize);
+
+impl SequenceSlot {
+    pub fn handle(self) -> u32 {
+        TRANSIENT_FIRST + self.0 as u32
+    }
+}
+
+fn slot_of(h: u32) -> Option<usize> {
+    if handle_type(h) != ht::TRANSIENT {
+        return None;
+    }
+    let slot = h.checked_sub(TRANSIENT_FIRST)? as usize;
+    (slot < MAX_LOADED_OBJECTS).then_some(slot)
+}
+
 impl Objects {
-    /// The loaded object `h` names: `None` when `h` is not a transient handle or its slot is
-    /// empty.
+    /// The loaded key or sealed object `h` names: `None` when `h` is not a transient handle,
+    /// or its slot is empty or holds a sequence.
     pub fn find(&self, h: u32) -> Option<Loaded> {
-        if handle_type(h) != ht::TRANSIENT {
-            return None;
-        }
-        let slot = h.checked_sub(TRANSIENT_FIRST)? as usize;
-        self.slots.get(slot)?.as_ref().map(|_| Loaded(slot))
+        let slot = slot_of(h)?;
+        matches!(self.slots[slot], Some(Occupant::Key(_))).then_some(Loaded(slot))
+    }
+
+    /// The running sequence `h` names, likewise.
+    pub fn find_sequence(&self, h: u32) -> Option<SequenceSlot> {
+        let slot = slot_of(h)?;
+        matches!(self.slots[slot], Some(Occupant::Sequence(_))).then_some(SequenceSlot(slot))
+    }
+
+    /// Whether anything is loaded under `h`.
+    pub fn is_occupied(&self, h: u32) -> bool {
+        slot_of(h).is_some_and(|s| self.slots[s].is_some())
     }
 
     pub fn get(&self, l: Loaded) -> &Object {
-        self.slots[l.0].as_ref().expect("a Loaded handle names an occupied slot")
+        match &self.slots[l.0] {
+            Some(Occupant::Key(o)) => o,
+            _ => unreachable!("a Loaded handle names a slot holding an object"),
+        }
+    }
+
+    pub fn sequence(&self, s: SequenceSlot) -> &HashSequence {
+        match &self.slots[s.0] {
+            Some(Occupant::Sequence(q)) => q,
+            _ => unreachable!("a SequenceSlot names a slot holding a sequence"),
+        }
+    }
+
+    pub fn sequence_mut(&mut self, s: SequenceSlot) -> &mut HashSequence {
+        match &mut self.slots[s.0] {
+            Some(Occupant::Sequence(q)) => q,
+            _ => unreachable!("a SequenceSlot names a slot holding a sequence"),
+        }
     }
 
     /// Puts `o` in the lowest free slot; `None` when every slot is taken
     /// (`TPM_RC_OBJECT_MEMORY`).
     pub fn insert(&mut self, o: Object) -> Option<Loaded> {
-        let slot = self.slots.iter().position(Option::is_none)?;
-        self.slots[slot] = Some(Box::new(o));
-        Some(Loaded(slot))
+        self.place(Occupant::Key(Box::new(o))).map(Loaded)
     }
 
-    pub fn remove(&mut self, l: Loaded) -> Box<Object> {
-        self.slots[l.0].take().expect("a Loaded handle names an occupied slot")
+    pub fn insert_sequence(&mut self, q: HashSequence) -> Option<SequenceSlot> {
+        self.place(Occupant::Sequence(Box::new(q))).map(SequenceSlot)
+    }
+
+    fn place(&mut self, o: Occupant) -> Option<usize> {
+        let slot = self.slots.iter().position(Option::is_none)?;
+        self.slots[slot] = Some(o);
+        Some(slot)
+    }
+
+    /// Empties the slot `h` names, returning what was in it.
+    pub fn remove(&mut self, h: u32) -> Option<Occupant> {
+        self.slots[slot_of(h)?].take()
     }
 
     pub fn loaded_count(&self) -> usize {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
 
-    /// The handles of loaded objects at or above `from`, in order.
+    /// The handles of loaded objects of either kind at or above `from`, in order.
     pub fn handles_from(&self, from: u32) -> Vec<u32> {
         (0..MAX_LOADED_OBJECTS)
             .filter(|&i| self.slots[i].is_some())

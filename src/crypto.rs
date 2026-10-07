@@ -396,33 +396,46 @@ pub enum RsaDecryptError {
     Value,
 }
 
-/// The platform's randomness, as the RNG the RSA and ECDSA code wants for blinding and salts.
-/// It wraps the platform, not a [`Drbg`], so a fresh value can never come from a generator
-/// that would repeat it.
-pub struct PlatformRng<'a, P: crate::Platform>(pub &'a mut P);
+/// The RNG the RSA and ECDSA code wants for blinding and salts: a [`Drbg`] seeded from 32
+/// bytes of the platform's randomness for one operation, as the reference feeds its consumers
+/// from its own DRBG (`CryptRand.c`). Within the operation the stream never repeats, so a
+/// library loop that draws until a value fits ends even when the platform's source has
+/// failed and gives one value over and over; across operations a value repeats only if the
+/// platform repeats the seed.
+pub struct PlatformRng(Drbg);
 
-impl<P: crate::Platform> rand_core::TryRng for PlatformRng<'_, P> {
+impl PlatformRng {
+    const LABEL: &'static [u8] = b"janus operation";
+
+    pub fn seeded(platform: &mut impl crate::Platform) -> PlatformRng {
+        let mut seed = Zeroizing::new([0u8; 32]);
+        platform.fill_random(&mut seed[..]);
+        PlatformRng(Drbg::new(&seed[..], Self::LABEL, &[]))
+    }
+}
+
+impl rand_core::TryRng for PlatformRng {
     type Error = core::convert::Infallible;
 
     fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
         let mut b = [0u8; 4];
-        self.0.fill_random(&mut b);
+        self.0.fill(&mut b);
         Ok(u32::from_le_bytes(b))
     }
 
     fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
         let mut b = [0u8; 8];
-        self.0.fill_random(&mut b);
+        self.0.fill(&mut b);
         Ok(u64::from_le_bytes(b))
     }
 
     fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
-        self.0.fill_random(dst);
+        self.0.fill(dst);
         Ok(())
     }
 }
 
-impl<P: crate::Platform> rand_core::TryCryptoRng for PlatformRng<'_, P> {}
+impl rand_core::TryCryptoRng for PlatformRng {}
 
 /// A P-256 point that is on the curve and not the identity.
 pub struct EccPublicKey(p256::PublicKey);

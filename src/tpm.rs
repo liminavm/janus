@@ -1734,7 +1734,7 @@ impl Tpm<Running> {
                 let sig = o
                     .rsa()
                     .expect("an RSA scheme is only selected for an RSA key")
-                    .sign(&mut crypto::PlatformRng(platform), pss, digest)
+                    .sign(&mut crypto::PlatformRng::seeded(platform), pss, digest)
                     .ok_or(Fmt1::Value)
                     .map_err(Rc::bare)?;
                 out.tpm2b(&sig);
@@ -1801,7 +1801,7 @@ impl Tpm<Running> {
         let m = o
             .rsa()
             .expect("an RSA object")
-            .decrypt(&mut crypto::PlatformRng(platform), scheme, c)
+            .decrypt(&mut crypto::PlatformRng::seeded(platform), scheme, c)
             .map_err(|e| match e {
                 crypto::RsaDecryptError::Size => Rc::Fmt1(Fmt1::Size, None),
                 crypto::RsaDecryptError::Value => Rc::Fmt1(Fmt1::Value, None),
@@ -1849,7 +1849,7 @@ impl Tpm<Running> {
                             .rsa()
                             .expect("an RSA object")
                             .decrypt(
-                                &mut crypto::PlatformRng(platform),
+                                &mut crypto::PlatformRng::seeded(platform),
                                 crypto::RsaDecrypt::Oaep(SECRET_LABEL),
                                 input.encrypted_salt.as_slice(),
                             )

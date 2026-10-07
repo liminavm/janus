@@ -12,14 +12,21 @@ Entries match by substring of their name; with none, every entry runs. Every edi
 string replacement that must match once, and all targets are checked before anything builds, so
 a refactor that moves a target fails loudly instead of quietly testing nothing.
 
-A witness is a `cargo test` filter, or `kani:<harness>` for one Kani proof.
+A witness is a `cargo test` filter, or `kani:<harness>` for one Kani proof. A witness that runs
+past `WITNESS_TIMEOUT` is killed with everything it started and reported as `TIMEOUT`: a
+sabotage that makes something loop forever must not take the sweep, or the host, with it.
 """
 
+import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+
+# Seconds; the slowest witness (a Kani proof) takes a few minutes.
+WITNESS_TIMEOUT = 1800
 
 # (name, file, what to replace, what with, witness)
 SABOTAGES = [
@@ -492,6 +499,13 @@ SABOTAGES = [
         "        if false {",
         "nv_define_space_refuses_in_the_reference_order",
     ),
+    (
+        "the RSA code draws straight from a platform that may repeat itself",
+        "src/crypto.rs",
+        "    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {\n        self.0.fill(dst);",
+        "    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {\n        dst.fill(0);",
+        "rsa_signs_and_decrypts_even_when_the_platform_gives_only_zeros",
+    ),
 ]
 
 
@@ -499,6 +513,19 @@ def witness(w):
     if w.startswith('kani:'):
         return ['cargo', 'kani', '--harness', w[5:], '--exact']
     return ['cargo', 'test', '--quiet', w]
+
+
+def run(argv):
+    """The witness's exit code, or None when it ran past `WITNESS_TIMEOUT`. It runs in a
+    session of its own, so a timeout kills the test binary cargo started, not only cargo."""
+    p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    try:
+        return p.wait(timeout=WITNESS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
+        return None
 
 
 def main(patterns):
@@ -510,21 +537,21 @@ def main(patterns):
             bad.append(f'{name}: {path} has {n} matches for its target')
     if bad:
         sys.exit('\n'.join(bad))
-    survived = []
+    unproven = []
     for name, path, old, new, w in chosen:
         f = ROOT / path
         clean = f.read_text()
         f.write_text(clean.replace(old, new))
         try:
-            r = subprocess.run(witness(w), cwd=ROOT, capture_output=True)
+            code = run(witness(w))
         finally:
             f.write_text(clean)
-        verdict = 'RED' if r.returncode != 0 else 'SURVIVED'
+        verdict = 'TIMEOUT' if code is None else 'RED' if code != 0 else 'SURVIVED'
         print(f'{verdict:9} {name}  [{w}]', flush=True)
-        if verdict == 'SURVIVED':
-            survived.append(name)
-    if survived:
-        sys.exit(f'{len(survived)} sabotage(s) survived')
+        if verdict != 'RED':
+            unproven.append(name)
+    if unproven:
+        sys.exit(f'{len(unproven)} sabotage(s) survived or timed out')
 
 
 if __name__ == '__main__':

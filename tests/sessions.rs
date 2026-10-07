@@ -10,7 +10,7 @@
 //! RustCrypto primitives and none of janus's code. Each response's HMAC is checked, so a janus
 //! that answered with the wrong key or the wrong nonces fails here, not in a guest.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use aes::cipher::KeyIvInit;
@@ -19,16 +19,25 @@ use janus::{Janus, Locality, Platform};
 use p256::elliptic_curve::sec1::ToSec1Point;
 use sha2::{Digest as _, Sha256};
 
+#[path = "support/watchdog.rs"]
+mod watchdog;
+
 /// Deterministic randomness that remembers what it gave, so a test can check what GetRandom
-/// encrypted.
+/// encrypted. Once `stuck`, it gives only zeros, as a failed entropy source might.
 #[derive(Clone)]
 struct Recorder {
     next: Rc<RefCell<u8>>,
     given: Rc<RefCell<Vec<Vec<u8>>>>,
+    stuck: Rc<Cell<bool>>,
 }
 
 impl Platform for Recorder {
     fn fill_random(&mut self, buf: &mut [u8]) {
+        if self.stuck.get() {
+            buf.fill(0);
+            self.given.borrow_mut().push(buf.to_vec());
+            return;
+        }
         for b in buf.iter_mut() {
             let mut n = self.next.borrow_mut();
             *n = n.wrapping_add(1);
@@ -150,7 +159,7 @@ fn rc(rsp: &[u8]) -> u32 {
 
 /// A TPM with a recorder for randomness, started.
 fn started() -> (Janus<Recorder>, Recorder) {
-    let platform = Recorder { next: Rc::default(), given: Rc::default() };
+    let platform = Recorder { next: Rc::default(), given: Rc::default(), stuck: Rc::default() };
     let mut tpm = Janus::manufacture(platform.clone());
     tpm.init();
     let startup = command(0x8001, 0x144, &[], None, &[0, 0]);
@@ -780,6 +789,30 @@ fn rsa_decrypt(
         return (rc(&rsp), Vec::new());
     }
     (0, rsp[16..16 + u16_at(&rsp, 14) as usize].to_vec())
+}
+
+/// The RSA code draws until a value fits (a blinding factor below the modulus and invertible
+/// mod it); fed straight from a platform that gives only zeros, it never finds one. janus
+/// feeds it from a generator seeded per operation instead, so it ends.
+#[test]
+fn rsa_signs_and_decrypts_even_when_the_platform_gives_only_zeros() {
+    let _deadline = watchdog::watchdog(120, "an RSA operation under a stuck platform");
+    let (mut tpm, platform) = started();
+    let (srk, _) = primary(&mut tpm, RH_OWNER, RSA_SRK_TEMPLATE);
+    let (key, key_public) = child(&mut tpm, srk, RSA_KEY_TEMPLATE);
+    platform.stuck.set(true);
+    let verifier = rsa_public(&key_public);
+    let digest = sha256(&[b"to be signed"]);
+    let (code, sig) = sign(&mut tpm, key, &digest, &[0x00, 0x14, 0x00, 0x0B], &NULL_TICKET);
+    assert_eq!(code, 0, "RSASSA");
+    verifier
+        .verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &digest, &sig[6..])
+        .expect("RSASSA verifies");
+    let (code, sig) = sign(&mut tpm, key, &digest, &[0x00, 0x16, 0x00, 0x0B], &NULL_TICKET);
+    assert_eq!(code, 0, "RSAPSS");
+    verifier.verify(rsa::Pss::<Sha256>::new(), &digest, &sig[6..]).expect("RSAPSS verifies");
+    let c = verifier.encrypt(&mut Rng(0), rsa::Pkcs1v15Encrypt, b"a secret").unwrap();
+    assert_eq!(rsa_decrypt(&mut tpm, key, &c, &[0x00, 0x15], b""), (0, b"a secret".to_vec()));
 }
 
 #[test]

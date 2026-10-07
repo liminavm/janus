@@ -7,7 +7,7 @@
 //! reached the cases it exists for, so a change that makes a branch unreachable fails here
 //! rather than passing vacuously.
 
-use janus::{Janus, Locality, Platform};
+use janus::{Janus, Locality, Platform, SelfTests};
 use sha2::{Digest as _, Sha256};
 
 struct Zero;
@@ -18,6 +18,10 @@ impl Platform for Zero {
     }
     fn now_ms(&mut self) -> u64 {
         0
+    }
+    // The walks reset the TPM hundreds of thousands of times and test no cryptography.
+    fn self_tests(&mut self) -> SelfTests {
+        SelfTests::Skip
     }
 }
 
@@ -253,6 +257,10 @@ impl Platform for Clocked {
     }
     fn now_ms(&mut self) -> u64 {
         self.0.get()
+    }
+    // The walks reset the TPM hundreds of thousands of times and test no cryptography.
+    fn self_tests(&mut self) -> SelfTests {
+        SelfTests::Skip
     }
 }
 

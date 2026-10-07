@@ -3,9 +3,22 @@
 //! What the fuzz targets share: a deterministic platform and the response invariants every
 //! answer must keep, whatever the command was.
 
-use janus::{Janus, Locality, Platform};
+use std::cell::Cell;
+use std::rc::Rc;
 
-pub struct Fixed;
+use janus::{Janus, Locality, Platform, SelfTests};
+
+/// A deterministic platform whose self-tests fail while the flag it shares is set, so the
+/// record targets can drive the TPM into failure mode.
+pub struct Fixed(Rc<Cell<bool>>);
+
+impl Fixed {
+    /// The platform and its self-test failure flag.
+    pub fn new() -> (Fixed, Rc<Cell<bool>>) {
+        let fail = Rc::new(Cell::new(false));
+        (Fixed(fail.clone()), fail)
+    }
+}
 
 impl Platform for Fixed {
     fn fill_random(&mut self, buf: &mut [u8]) {
@@ -13,6 +26,11 @@ impl Platform for Fixed {
     }
     fn now_ms(&mut self) -> u64 {
         0
+    }
+    // The known answers are the unit tests' to check; run here they would cost each input
+    // far more than the command it carries.
+    fn self_tests(&mut self) -> SelfTests {
+        if self.0.get() { SelfTests::Fail } else { SelfTests::Skip }
     }
 }
 
@@ -58,10 +76,11 @@ fn run(tpm: &mut Janus<Fixed>, cmd: &[u8]) -> Vec<u8> {
 /// A started TPM holding what the context and session paths need to be reachable: a primary
 /// key at 0x80000000, an owner key made persistent at 0x81000001, systemd-pcrlock's extend
 /// index at 0x01d10201, an HMAC session at 0x02000000, and, saved and out of memory, another
-/// primary key and another session. Returns the TPM and the two saved `TPMS_CONTEXT`s, which
-/// are the same on every run because [`Fixed`] is.
-pub fn prepared() -> (Janus<Fixed>, Vec<Vec<u8>>) {
-    let mut tpm = Janus::manufacture(Fixed);
+/// primary key and another session. Returns the TPM, its self-test failure flag and the two
+/// saved `TPMS_CONTEXT`s, which are the same on every run because [`Fixed`] is.
+pub fn prepared() -> (Janus<Fixed>, Rc<Cell<bool>>, Vec<Vec<u8>>) {
+    let (platform, fail) = Fixed::new();
+    let mut tpm = Janus::manufacture(platform);
     tpm.init();
     run(&mut tpm, &STARTUP);
     let mut create = 0x4000_0007u32.to_be_bytes().to_vec();
@@ -100,11 +119,11 @@ pub fn prepared() -> (Janus<Fixed>, Vec<Vec<u8>>) {
     run(&mut tpm, &session);
     run(&mut tpm, &session);
     let saved_session = run(&mut tpm, &save(0x0200_0001))[10..].to_vec();
-    (tpm, vec![object, saved_session])
+    (tpm, fail, vec![object, saved_session])
 }
 
 /// Runs a record stream (see the `sequence` target) into `tpm`, checking every response.
-pub fn run_records(tpm: &mut Janus<Fixed>, data: &[u8]) {
+pub fn run_records(tpm: &mut Janus<Fixed>, fail: &Cell<bool>, data: &[u8]) {
     let mut locality = Locality::ZERO;
     let mut rest = data;
     while let Some((&op, tail)) = rest.split_first() {
@@ -112,6 +131,7 @@ pub fn run_records(tpm: &mut Janus<Fixed>, data: &[u8]) {
         match op {
             0 => tpm.init(),
             1..=5 => locality = Locality::new(op - 1).unwrap(),
+            6 => fail.set(!fail.get()),
             _ => {
                 if rest.len() < 2 {
                     return;

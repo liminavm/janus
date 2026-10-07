@@ -58,7 +58,7 @@ fn main() {
         record.extend_from_slice(cmd);
         fs::write(prepared.join(format!("{i:05}")), record).unwrap();
     }
-    let (_, contexts) = janus_fuzz::prepared();
+    let (_, _, contexts) = janus_fuzz::prepared();
     for (i, c) in contexts.iter().enumerate() {
         fs::write(prepared.join(format!("context-{i}")), janus_fuzz::context_load_record(c))
             .unwrap();

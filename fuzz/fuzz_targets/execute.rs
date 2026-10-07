@@ -9,7 +9,7 @@ use janus_fuzz::{Fixed, STARTUP, check_response};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let mut tpm = Janus::manufacture(Fixed);
+    let mut tpm = Janus::manufacture(Fixed::new().0);
     tpm.init();
     check_response(&tpm.execute(Locality::ZERO, &STARTUP));
     check_response(&tpm.execute(Locality::ZERO, data));

@@ -26,6 +26,7 @@ mod nv;
 mod object;
 mod pcr;
 pub mod rc;
+mod selftest;
 mod sequence;
 mod session;
 mod tpm;
@@ -64,4 +65,24 @@ pub trait Platform {
     /// TPM's `Clock` advances by them while the TPM runs, and its `Time` counts them since
     /// `_TPM_Init`. A reading lower than the one before counts as no time.
     fn now_ms(&mut self) -> u64;
+
+    /// What the next self-test does. A real platform leaves this as it is.
+    fn self_tests(&mut self) -> SelfTests {
+        SelfTests::Run
+    }
+}
+
+/// What a platform has the TPM's self-tests do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelfTests {
+    /// Run them.
+    Run,
+    /// Count them as passed without running them, as a platform that tests its cryptography
+    /// some other way leaves tests out (`_plat_GetEnabledSelfTest`). For tests and fuzzers
+    /// that make a new TPM for every input and would otherwise spend their time on the
+    /// known answers.
+    Skip,
+    /// Fail them, whatever they compute (`_plat__SetForceFailureMode`): failure mode, for
+    /// testing it.
+    Fail,
 }

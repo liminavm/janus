@@ -4,7 +4,7 @@
 //! failures, lockout, locality, and malformed session areas. Each expected code is the one the
 //! TCG reference implementation returns for the same command.
 
-use janus::{Janus, Locality, Platform};
+use janus::{Janus, Locality, Platform, SelfTests};
 
 struct Zero;
 
@@ -847,4 +847,135 @@ fn dictionary_attack_parameters_set_the_limits() {
     assert_eq!(exec(&mut tpm, &nv_read_with(index, index, b"no")), 0x98E);
     assert_eq!(da_state(&mut tpm), ([0, 1, 0, 20], false));
     assert_eq!(exec(&mut tpm, &nv_read_with(index, index, b"pin")), 0x14A);
+}
+
+/// A platform whose self-tests fail while its flag is set (`_plat__SetForceFailureMode`).
+struct Faulty(std::rc::Rc<std::cell::Cell<bool>>);
+
+impl Platform for Faulty {
+    fn fill_random(&mut self, buf: &mut [u8]) {
+        buf.fill(0);
+    }
+    fn now_ms(&mut self) -> u64 {
+        0
+    }
+    fn self_tests(&mut self) -> SelfTests {
+        if self.0.get() { SelfTests::Fail } else { SelfTests::Run }
+    }
+}
+
+fn self_test(full: bool) -> Vec<u8> {
+    cmd(NO_SESSIONS, 0x143, &[full as u8])
+}
+
+fn get_test_result() -> Vec<u8> {
+    cmd(NO_SESSIONS, 0x17C, &[])
+}
+
+/// GetTestResult in failure mode: twelve bytes of data, a failure location whose low half
+/// names the family, `FATAL_ERROR_SELF_TEST`, then TPM_RC_FAILURE (`TpmFailureMode`).
+fn failed_at(family: u32) -> Vec<u8> {
+    let mut v = vec![0x80, 0x01, 0, 0, 0, 0x1C, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0];
+    v.extend_from_slice(&family.to_be_bytes());
+    v.extend_from_slice(&6u32.to_be_bytes());
+    v.extend_from_slice(&0x101u32.to_be_bytes());
+    v
+}
+
+const FAILURE: [u8; 10] = [0x80, 0x01, 0, 0, 0, 10, 0, 0, 0x01, 0x01];
+
+#[test]
+fn self_tests_pass_and_get_test_result_reports_success() {
+    let mut tpm = started();
+    assert_eq!(run(&mut tpm, &self_test(true)), 0);
+    assert_eq!(run(&mut tpm, &self_test(false)), 0);
+    // CryptGetTestResult: no data, TPM_RC_SUCCESS.
+    assert_eq!(
+        tpm.execute(Locality::ZERO, &get_test_result()),
+        [0x80, 0x01, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
+}
+
+#[test]
+fn a_failed_self_test_answers_only_get_test_result_and_properties_until_init() {
+    let fail = std::rc::Rc::new(std::cell::Cell::new(false));
+    let mut tpm = Janus::manufacture(Faulty(fail.clone()));
+    tpm.init();
+    assert_eq!(exec(&mut tpm, &startup(false)), 0);
+    assert_eq!(exec(&mut tpm, &extend(16)), 0);
+    assert_eq!(exec(&mut tpm, &shutdown(true)), 0);
+    // Hashing and AES were tested before Startup and the extend; P-256 is next, before the
+    // first command that may use a key.
+    fail.set(true);
+    assert_eq!(exec(&mut tpm, &extend(16)), 0);
+    assert_eq!(tpm.execute(Locality::ZERO, &plain_session()), FAILURE);
+
+    // Anything but the two is TPM_RC_FAILURE, before its frame is even checked.
+    for c in [extend(16), startup(false), self_test(true), vec![0x80], vec![]] {
+        assert_eq!(tpm.execute(Locality::ZERO, &c), FAILURE, "{c:02x?}");
+    }
+    assert_eq!(tpm.execute(Locality::ZERO, &get_test_result()), failed_at(3));
+    let property = |tpm: &mut Janus<Faulty>, pt: u32, count: u32| {
+        tpm.execute(Locality::ZERO, &cmd(NO_SESSIONS, 0x17A, &get_capability(6, pt, count)))
+    };
+    // One vendor property at a time, below MANUFACTURER clamped to it.
+    let jnus = [0x80, 0x01, 0, 0, 0, 27, 0, 0, 0, 0, 1, 0, 0, 0, 6, 0, 0, 0, 1];
+    for (pt, count) in [(0x105, 1), (0x100, 8), (0, 1)] {
+        let mut want = jnus.to_vec();
+        want.extend_from_slice(&[0, 0, 1, 0x05, b'J', b'N', b'U', b'S']);
+        assert_eq!(property(&mut tpm, pt, count), want, "{pt:#x}");
+    }
+    let mut last = vec![0x80, 0x01, 0, 0, 0, 27, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 1];
+    last.extend_from_slice(&[0, 0, 1, 0x0C, 0, 0, 0, 0]);
+    assert_eq!(property(&mut tpm, 0x10C, 1), last);
+    // No properties asked for, or none past FIRMWARE_VERSION_2: an empty list.
+    let empty = |more: u8| vec![0x80, 0x01, 0, 0, 0, 19, 0, 0, 0, 0, more, 0, 0, 0, 6, 0, 0, 0, 0];
+    assert_eq!(property(&mut tpm, 0x105, 0), empty(1));
+    assert_eq!(property(&mut tpm, 0x200, 1), empty(0));
+    // Not exactly what the reference parses: TPM_RC_FAILURE.
+    let mut long = cmd(NO_SESSIONS, 0x17A, &get_capability(6, 0x105, 1));
+    long.extend_from_slice(&[0; 4]);
+    long[5] = 26;
+    for c in [
+        cmd(NO_SESSIONS, 0x17A, &get_capability(0, 0x105, 1)),
+        cmd(SESSIONS, 0x17A, &get_capability(6, 0x105, 1)),
+        cmd(NO_SESSIONS, 0x17A, &get_capability(6, 0x105, 1)[..8]),
+        long,
+        cmd(NO_SESSIONS, 0x17C, &[0]),
+        cmd(SESSIONS, 0x17C, &[]),
+    ] {
+        assert_eq!(tpm.execute(Locality::ZERO, &c), FAILURE, "{c:02x?}");
+    }
+
+    // A _TPM_Init leaves failure mode with nothing changed: the Shutdown(STATE) before it is
+    // resumed.
+    tpm.init();
+    fail.set(false);
+    assert_eq!(exec(&mut tpm, &startup(true)), 0);
+    assert_eq!(exec(&mut tpm, &plain_session()), 0);
+
+    // A failure while the TPM waits for Startup: Startup itself hashes.
+    tpm.init();
+    fail.set(true);
+    assert_eq!(tpm.execute(Locality::ZERO, &startup(false)), FAILURE);
+    assert_eq!(tpm.execute(Locality::ZERO, &get_test_result()), failed_at(1));
+    tpm.init();
+    fail.set(false);
+    assert_eq!(exec(&mut tpm, &startup(false)), 0);
+}
+
+#[test]
+fn self_test_tests_what_is_left_or_everything_again() {
+    let fail = std::rc::Rc::new(std::cell::Cell::new(false));
+    let mut tpm = Janus::manufacture(Faulty(fail.clone()));
+    tpm.init();
+    assert_eq!(exec(&mut tpm, &startup(false)), 0);
+    assert_eq!(exec(&mut tpm, &self_test(false)), 0);
+    // Everything is tested: a partial test has nothing left to fail.
+    fail.set(true);
+    assert_eq!(exec(&mut tpm, &self_test(false)), 0);
+    assert_eq!(exec(&mut tpm, &plain_session()), 0);
+    // A full test starts over, with hashing.
+    assert_eq!(tpm.execute(Locality::ZERO, &self_test(true)), FAILURE);
+    assert_eq!(tpm.execute(Locality::ZERO, &get_test_result()), failed_at(1));
 }

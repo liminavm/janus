@@ -5,7 +5,9 @@
 //! After `_TPM_Init` a TPM accepts only `TPM2_Startup`; after it, everything but `TPM2_Startup`.
 //! The two are different types here, [`Tpm<Initialized>`] and [`Tpm<Running>`], and only the
 //! running one has PCRs, objects or a platform authorization to act on. A command that needs
-//! them cannot be dispatched before Startup, because there is nothing to dispatch it to.
+//! them cannot be dispatched before Startup, because there is nothing to dispatch it to. A
+//! failed self-test makes it a third, [`Tpm<Failure>`], which answers only what failure mode
+//! answers until the next `_TPM_Init`.
 //!
 //! State lives at three lifetimes, as the reference keeps it:
 //!
@@ -34,6 +36,7 @@ use crate::nv::{self, NvAuth, NvPublic, NvRef, NvStore};
 use crate::object::{self, Evicted, Loaded, Object, Objects, SensitiveKind, SequenceSlot};
 use crate::pcr::{self, Pcrs, Selection};
 use crate::rc::{At, Fmt0, Fmt1, Rc, Slot, Warn};
+use crate::selftest::{self, Family, ToTest};
 use crate::sequence::{self, HashSequence};
 use crate::session::{
     self, AuthValue, Authorization, Authorized, Da, Entity, EntityAuth, Lockout, Session,
@@ -111,6 +114,14 @@ pub struct Initialized {
     carried: Option<Box<Carried>>,
 }
 
+/// After a self-test failed: the TPM answers only `TPM2_GetTestResult` and some of
+/// `TPM2_GetCapability` until the next `_TPM_Init`, and changes nothing, not even its clock.
+pub struct Failure {
+    failed: Family,
+    /// What the TPM was running with, for a Restart or Resume after the next `_TPM_Init`.
+    carried: Option<Box<Carried>>,
+}
+
 struct Carried {
     platform_auth: AuthValue,
     reset: ResetState,
@@ -134,6 +145,8 @@ pub struct Tpm<S> {
     /// Kept apart from [`Persistent`] so the authorization check can update it while it reads
     /// an authorization value from there.
     lockout: Lockout,
+    /// The algorithm families still to be self-tested since `_TPM_Init`.
+    to_test: ToTest,
     stage: S,
 }
 
@@ -169,6 +182,7 @@ enum Lifecycle {
     // objects too.
     Initialized(Box<Tpm<Initialized>>),
     Running(Box<Tpm<Running>>),
+    Failure(Box<Tpm<Failure>>),
 }
 
 /// A TPM 2.0. The device that owns it delivers each command with the locality it arrived at,
@@ -203,6 +217,7 @@ impl<P: Platform> Janus<P> {
             persistent,
             clocks: Clocks { last: now, init_at: now },
             lockout: Lockout::manufactured(),
+            to_test: ToTest::ALL,
             stage: Initialized { carried: None },
         };
         Janus { platform, lifecycle: Some(Lifecycle::Initialized(Box::new(tpm))) }
@@ -214,16 +229,16 @@ impl<P: Platform> Janus<P> {
         let now = self.platform.now_ms();
         let mut next = match self.lifecycle.take().expect("the TPM is between stages") {
             Lifecycle::Initialized(t) => t,
-            Lifecycle::Running(t) => {
-                let Tpm { persistent, clocks, lockout, stage } = *t;
-                let Running { platform_auth, mut reset, .. } = stage;
-                reset.sessions.drop_loaded();
-                let carried = Some(Box::new(Carried { platform_auth, reset }));
-                Box::new(Tpm { persistent, clocks, lockout, stage: Initialized { carried } })
+            Lifecycle::Running(t) => Box::new(t.stop()),
+            Lifecycle::Failure(t) => {
+                let Tpm { persistent, clocks, lockout, to_test, stage } = *t;
+                let stage = Initialized { carried: stage.carried };
+                Box::new(Tpm { persistent, clocks, lockout, to_test, stage })
             }
         };
         next.tick(now);
         next.clocks.init_at = now;
+        next.to_test = ToTest::ALL;
         self.lifecycle = Some(Lifecycle::Initialized(next));
     }
 
@@ -237,6 +252,11 @@ impl<P: Platform> Janus<P> {
     }
 
     fn dispatch(&mut self, locality: Locality, bytes: &[u8]) -> Result<Vec<u8>, Rc> {
+        // In failure mode not even the frame is checked as usual: the reference answers
+        // before it parses anything (`TpmFailureMode`).
+        if let Some(Lifecycle::Failure(t)) = &self.lifecycle {
+            return Ok(selftest::failure_answer(t.stage.failed, bytes));
+        }
         let cmd = command::frame(bytes)?;
         let now = self.platform.now_ms();
         let mut lifecycle = self.lifecycle.take().expect("the TPM is between stages");
@@ -246,8 +266,29 @@ impl<P: Platform> Janus<P> {
                 t.tick(now);
                 t.lockout.self_heal(t.time());
             }
+            Lifecycle::Failure(_) => unreachable!("failure mode answered above"),
+        }
+        // Each family a command may use is tested before the command reads anything, so a
+        // failure leaves the state as it was (the reference commits nothing from a command
+        // that entered failure mode).
+        let families = selftest::families(cmd.cc);
+        let failed = match &mut lifecycle {
+            Lifecycle::Initialized(t) if cmd.cc == Cc::Startup => {
+                t.to_test.test(families, &mut self.platform);
+                t.to_test.failed()
+            }
+            Lifecycle::Running(t) if cmd.cc != Cc::Startup => {
+                t.to_test.test(families, &mut self.platform);
+                t.to_test.failed()
+            }
+            _ => None,
+        };
+        if let Some(failed) = failed {
+            self.lifecycle = Some(lifecycle.fail(failed));
+            return Err(Fmt0::Failure.into());
         }
         let (next, result) = match lifecycle {
+            Lifecycle::Failure(_) => unreachable!("failure mode answered above"),
             Lifecycle::Initialized(tpm) if cmd.cc == Cc::Startup => {
                 match (*tpm).startup(&mut self.platform, locality, cmd) {
                     Ok((running, response)) => {
@@ -267,11 +308,31 @@ impl<P: Platform> Janus<P> {
             }
             Lifecycle::Running(mut tpm) => {
                 let r = tpm.execute(&mut self.platform, locality, cmd);
-                (Lifecycle::Running(tpm), r)
+                // Only TPM2_SelfTest tests here; what it found wrong is the response.
+                match tpm.to_test.failed() {
+                    Some(failed) => {
+                        (Lifecycle::Running(tpm).fail(failed), Err(Fmt0::Failure.into()))
+                    }
+                    None => (Lifecycle::Running(tpm), r),
+                }
             }
         };
         self.lifecycle = Some(next);
         result
+    }
+}
+
+impl Lifecycle {
+    /// Failure mode, keeping what a Restart or Resume after the next `_TPM_Init` needs.
+    fn fail(self, failed: Family) -> Lifecycle {
+        let t = match self {
+            Lifecycle::Initialized(t) => *t,
+            Lifecycle::Running(t) => t.stop(),
+            Lifecycle::Failure(t) => return Lifecycle::Failure(t),
+        };
+        let Tpm { persistent, clocks, lockout, to_test, stage } = t;
+        let stage = Failure { failed, carried: stage.carried };
+        Lifecycle::Failure(Box::new(Tpm { persistent, clocks, lockout, to_test, stage }))
     }
 }
 
@@ -359,6 +420,7 @@ impl Tpm<Initialized> {
             persistent: self.persistent,
             clocks: self.clocks,
             lockout: self.lockout,
+            to_test: self.to_test,
             stage: Running {
                 pcrs,
                 platform_auth,
@@ -486,6 +548,16 @@ impl Marshal for HashCheck {
 }
 
 impl Tpm<Running> {
+    /// What survives a platform reset: loaded sessions and objects and the PCRs are gone, and
+    /// the rest is carried for a Restart or Resume.
+    fn stop(self) -> Tpm<Initialized> {
+        let Tpm { persistent, clocks, lockout, to_test, stage } = self;
+        let Running { platform_auth, mut reset, .. } = stage;
+        reset.sessions.drop_loaded();
+        let carried = Some(Box::new(Carried { platform_auth, reset }));
+        Tpm { persistent, clocks, lockout, to_test, stage: Initialized { carried } }
+    }
+
     fn execute(
         &mut self,
         platform: &mut impl Platform,
@@ -521,9 +593,22 @@ impl Tpm<Running> {
                 let raw = cmd.params();
                 let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
                 let mut r = Reader::new(&params);
-                bool::read(&mut r).at(At::param(1))?;
+                let full = bool::read(&mut r).at(At::param(1))?;
                 r.finish().map_err(Rc::bare)?;
+                self.to_test.self_test(full, platform);
                 (None, Writer::new(), auth)
+            }
+            Cc::GetTestResult => {
+                let mut auth = self.read_auth(&mut cmd, Vec::new())?;
+                let raw = cmd.params();
+                let params = auth.finish(&self.stage.reset.sessions, raw, &mut self.lockout)?;
+                Reader::new(&params).finish().map_err(Rc::bare)?;
+                // Running, every test so far has passed: no data, and TPM_RC_SUCCESS
+                // (`TPM2_GetTestResult` via `CryptGetTestResult`).
+                let mut out = Writer::new();
+                out.tpm2b(&[]);
+                out.u32(0);
+                (None, out, auth)
             }
             Cc::GetCapability => {
                 let mut auth = self.read_auth(&mut cmd, Vec::new())?;

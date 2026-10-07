@@ -10,6 +10,6 @@ use janus_fuzz::{prepared, run_records};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let (mut tpm, _) = prepared();
-    run_records(&mut tpm, data);
+    let (mut tpm, fail, _) = prepared();
+    run_records(&mut tpm, &fail, data);
 });

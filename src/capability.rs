@@ -72,6 +72,11 @@ const fn chars(s: &[u8; 4]) -> u32 {
 
 /// The fixed properties, in `TPM_PT` order. Values for things the engine does not have yet
 /// (contexts, NV) are the bounds those features will be built to.
+/// The value of fixed property `pt`, if the TPM has it.
+pub fn fixed(pt: u32) -> Option<u32> {
+    FIXED.iter().find(|(t, _)| *t == pt).map(|(_, v)| *v)
+}
+
 const FIXED: &[(u32, u32)] = &[
     (0x100, chars(b"2.0\0")),               // FAMILY_INDICATOR
     (0x101, 0),                             // LEVEL

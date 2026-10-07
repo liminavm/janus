@@ -1,0 +1,40 @@
+[package]
+name = "janus-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+janus = { path = ".." }
+serde_json = "1.0.151"
+
+# Its own workspace, so `cargo fuzz` builds it with its own flags and the engine's build never
+# sees it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "seed-corpora"
+path = "src/bin/seed-corpora.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "execute"
+path = "fuzz_targets/execute.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sequence"
+path = "fuzz_targets/sequence.rs"
+test = false
+doc = false
+bench = false

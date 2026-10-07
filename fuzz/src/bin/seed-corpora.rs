@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Seeds the fuzz corpora from the guest captures in `tests/corpus`. Random bytes almost never
+//! form a command, let alone one with a valid session area, so every target starts from what
+//! real guests sent.
+//!
+//!     cargo run --manifest-path fuzz/Cargo.toml --bin seed-corpora     (from the crate root)
+//!
+//! `execute` gets every distinct command. `sequence` gets each capture as one record stream,
+//! with `_TPM_Init` and locality changes where the capture had them.
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
+
+fn hex(s: &str) -> Vec<u8> {
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+}
+
+fn main() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let execute = root.join("fuzz/corpus/execute");
+    let sequence = root.join("fuzz/corpus/sequence");
+    fs::create_dir_all(&execute).unwrap();
+    fs::create_dir_all(&sequence).unwrap();
+    let mut commands = BTreeSet::new();
+    let mut captures: Vec<_> = fs::read_dir(root.join("tests/corpus")).unwrap().flatten().collect();
+    captures.sort_by_key(|e| e.path());
+    for entry in captures {
+        let text = fs::read_to_string(entry.path()).unwrap();
+        let mut stream = Vec::new();
+        for line in text.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            match v.get("ctrl").and_then(|c| c.as_str()) {
+                Some("init") => stream.push(0),
+                Some("locality") => stream.push(1 + v["value"].as_u64().unwrap() as u8),
+                Some(_) => {}
+                None => {
+                    let cmd = hex(v["cmd"].as_str().unwrap());
+                    stream.push(0xFF);
+                    stream.extend_from_slice(&(cmd.len() as u16).to_be_bytes());
+                    stream.extend_from_slice(&cmd);
+                    commands.insert(cmd);
+                }
+            }
+        }
+        let name = entry.path().file_stem().unwrap().to_string_lossy().into_owned();
+        fs::write(sequence.join(name), stream).unwrap();
+    }
+    for (i, cmd) in commands.iter().enumerate() {
+        fs::write(execute.join(format!("{i:05}")), cmd).unwrap();
+    }
+    println!("{} commands, sequences from every capture", commands.len());
+}

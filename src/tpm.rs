@@ -30,7 +30,7 @@ use crate::handle::{
 };
 use crate::hierarchy::{Hierarchy, NullSecrets, PersistentSecrets, Secrets};
 use crate::marshal::{List, Marshal, Tpm2b, Unmarshal};
-use crate::object::{self, Loaded, Object, Objects, SensitiveKind, SequenceSlot};
+use crate::object::{self, Evicted, Loaded, Object, Objects, SensitiveKind, SequenceSlot};
 use crate::pcr::{self, Pcrs, Selection};
 use crate::rc::{At, Fmt0, Fmt1, Rc, Slot, Warn};
 use crate::sequence::{self, HashSequence};
@@ -45,6 +45,7 @@ use crate::types::{
 };
 use crate::wire::{Blame as _, Buf, Reader, Writer};
 use crate::{Locality, Platform};
+use std::cell::Cell;
 
 /// What survives `_TPM_Init`: the state a real TPM keeps in NV.
 struct Persistent {
@@ -63,6 +64,8 @@ struct Persistent {
     /// save; it is set again when `Clock` crosses a save boundary, as the reference sets it when
     /// it writes the clock to NV.
     clock_safe: bool,
+    /// Objects made persistent by `TPM2_EvictControl`.
+    evicted: Evicted,
     /// The last `TPM2_Shutdown`, until a Startup takes it or a command makes it stale.
     orderly: Option<Orderly>,
 }
@@ -117,6 +120,9 @@ pub struct Running {
     platform_auth: AuthValue,
     reset: ResetState,
     objects: Objects,
+    /// Slots the persistent objects this command names occupy while it runs: the reference
+    /// copies each into a free transient slot for the command (`ObjectLoadEvict`).
+    borrowed: Cell<usize>,
 }
 
 pub struct Tpm<S> {
@@ -177,6 +183,7 @@ impl<P: Platform> Janus<P> {
             reset_count: 0,
             clock: 0,
             clock_safe: true,
+            evicted: Evicted::default(),
             orderly: None,
         };
         let now = platform.now_ms();
@@ -332,7 +339,13 @@ impl Tpm<Initialized> {
             persistent: self.persistent,
             clocks: self.clocks,
             lockout: self.lockout,
-            stage: Running { pcrs, platform_auth, reset, objects: Objects::default() },
+            stage: Running {
+                pcrs,
+                platform_auth,
+                reset,
+                objects: Objects::default(),
+                borrowed: Cell::new(0),
+            },
         };
         Ok((running, command::success(tag, None, &[], &[])))
     }
@@ -435,6 +448,7 @@ impl Tpm<Running> {
         let tag = cmd.tag;
         let cc = cmd.cc;
         let attributes = cc.attributes();
+        self.stage.borrowed.set(0);
         // Each arm classifies the handles (TPM_RC_VALUE at the handle), checks that what they
         // name is loaded (TPM_RC_REFERENCE_Hn / TPM_RC_HANDLE), then reads the authorization
         // area, authorizes the handles that need it, and reads the parameters; the reference's
@@ -548,27 +562,37 @@ impl Tpm<Running> {
                 self.pcr_extend(target, locality, &digests)?;
                 (None, Writer::new(), auth)
             }
+            Cc::EvictControl => {
+                let [a, h] = cmd.handles()?;
+                // TPMI_RH_PROVISION.
+                let provision = match a {
+                    crate::handle::rh::OWNER => HierarchyAuth::Owner,
+                    crate::handle::rh::PLATFORM => HierarchyAuth::Platform,
+                    _ => return Err(Rc::Fmt1(Fmt1::Value, Some(At::handle(1)))),
+                };
+                let target = self.object_handle(h, false, 2)?.expect("not NULL");
+                let names = vec![handle_name(a), self.name_of_object(Some(target))];
+                let mut auth = self.read_auth(&mut cmd, names)?;
+                let raw = cmd.params();
+                let provision = self.authorize_hierarchy(&mut auth, raw, provision)?;
+                let params = auth.finish(&self.stage.reset.sessions, raw)?;
+                let mut r = Reader::new(&params);
+                // TPMI_DH_PERSISTENT.
+                let persistent = r.u32().at(At::param(1))?;
+                if handle_type(persistent) != ht::PERSISTENT {
+                    return Err(Rc::Fmt1(Fmt1::Value, Some(At::param(1))));
+                }
+                r.finish().map_err(Rc::bare)?;
+                self.evict_control(provision.entity(), target, persistent)?;
+                (None, Writer::new(), auth)
+            }
             Cc::HierarchyChangeAuth => {
                 let [h] = cmd.handles()?;
                 let hierarchy =
                     HierarchyAuth::from_handle(h).ok_or(Fmt1::Value).at(At::handle(1))?;
                 let mut auth = self.read_auth(&mut cmd, vec![handle_name(h)])?;
                 let raw = cmd.params();
-                let entity = EntityAuth {
-                    name: &h.to_be_bytes(),
-                    value: hierarchy_value(&self.persistent, &self.stage.platform_auth, hierarchy),
-                    policy: &[],
-                    da: hierarchy_da(hierarchy),
-                    value_available: true,
-                };
-                let hierarchy = auth.authorize(
-                    &self.stage.reset.sessions,
-                    raw,
-                    hierarchy,
-                    &entity,
-                    &mut self.lockout,
-                    self.stage.pcrs.counter(),
-                )?;
+                let hierarchy = self.authorize_hierarchy(&mut auth, raw, hierarchy)?;
                 let params = auth.finish(&self.stage.reset.sessions, raw)?;
                 let mut r = Reader::new(&params);
                 let new = AuthValue::from_wire(r.tpm2b::<MAX_DIGEST>().at(At::param(1))?);
@@ -628,7 +652,7 @@ impl Tpm<Running> {
                 let raw = cmd.params();
                 let params = auth.finish(&self.stage.reset.sessions, raw)?;
                 Reader::new(&params).finish().map_err(Rc::bare)?;
-                let o = self.stage.objects.get(target.expect("ReadPublic refuses NULL"));
+                let o = self.object(target.expect("ReadPublic refuses NULL"));
                 let mut out = Writer::new();
                 Tpm2b(&o.public).write(&mut out);
                 o.name().write(&mut out);
@@ -736,7 +760,7 @@ impl Tpm<Running> {
                 let item = self.authorize_object(&mut auth, raw, item)?.entity();
                 let params = auth.finish(&self.stage.reset.sessions, raw)?;
                 Reader::new(&params).finish().map_err(Rc::bare)?;
-                let o = self.stage.objects.get(item);
+                let o = self.object(item);
                 let SensitiveKind::KeyedHash(data) = &o.sensitive.kind else {
                     return Err(Rc::Fmt1(Fmt1::Type, Some(At::handle(1))));
                 };
@@ -900,6 +924,7 @@ impl Tpm<Running> {
             lockout_auth_set: !p.lockout_auth.is_empty(),
             orderly: p.orderly.is_some(),
             transient: self.stage.objects.handles_from(0),
+            persistent: self.persistent.evicted.handles_from(0),
             loaded_sessions: sessions.handles_from(0, false),
             saved_sessions: sessions.handles_from(0, true),
         }
@@ -937,8 +962,102 @@ impl Tpm<Running> {
                 None if self.stage.objects.find_sequence(h).is_some() => Err(Fmt0::Sequence.into()),
                 None => Err(Warn::ReferenceH(slot).into()),
             },
-            ObjectHandle::Persistent(_) => Err(Rc::Fmt1(Fmt1::Handle, Some(At::handle(n)))),
+            ObjectHandle::Persistent(h) => {
+                // The reference copies the object into a free slot first (`ObjectLoadEvict`):
+                // TPM_RC_OBJECT_MEMORY before TPM_RC_HANDLE.
+                if self.slots_full() {
+                    return Err(Warn::ObjectMemory.into());
+                }
+                let l = self
+                    .persistent
+                    .evicted
+                    .find(h)
+                    .ok_or(Rc::Fmt1(Fmt1::Handle, Some(At::handle(n))))?;
+                self.stage.borrowed.set(self.stage.borrowed.get() + 1);
+                Ok(Some(l))
+            }
         }
+    }
+
+    /// A hierarchy's authorization: its authValue, always available, and no policy.
+    fn authorize_hierarchy(
+        &mut self,
+        auth: &mut Authorization,
+        params: &[u8],
+        h: HierarchyAuth,
+    ) -> Result<Authorized<HierarchyAuth>, Rc> {
+        let name = handle_name(h.handle());
+        let entity = EntityAuth {
+            name: name.as_slice(),
+            value: hierarchy_value(&self.persistent, &self.stage.platform_auth, h),
+            policy: &[],
+            da: hierarchy_da(h),
+            value_available: true,
+        };
+        auth.authorize(
+            &self.stage.reset.sessions,
+            params,
+            h,
+            &entity,
+            &mut self.lockout,
+            self.stage.pcrs.counter(),
+        )
+    }
+
+    /// `TPM2_EvictControl`, in the reference's order: an object that cannot outlive a reset
+    /// (ATTRIBUTES), a persistent object named by another handle (HANDLE), the hierarchy the
+    /// authorization may act for (HIERARCHY) and the handle range it owns (RANGE), then a handle
+    /// in use (TPM_RC_NV_DEFINED) or no room (TPM_RC_NV_SPACE). A transient object is copied to
+    /// `persistent`; a persistent one is removed.
+    fn evict_control(
+        &mut self,
+        provision: HierarchyAuth,
+        target: Loaded,
+        persistent: u32,
+    ) -> Result<(), Rc> {
+        let o = self.object(target);
+        let evicted = target.is_persistent();
+        // The NULL hierarchy's objects are the reference's `temporary` ones.
+        if o.hierarchy == Hierarchy::Null || o.public.attributes.st_clear() {
+            return Err(Rc::Fmt1(Fmt1::Attributes, Some(At::handle(2))));
+        }
+        if evicted && target.handle() != persistent {
+            return Err(Rc::Fmt1(Fmt1::Handle, Some(At::handle(2))));
+        }
+        let platform_object = o.hierarchy == Hierarchy::Platform;
+        let platform_range = persistent >= object::PLATFORM_PERSISTENT;
+        let wrong_hierarchy = match provision {
+            HierarchyAuth::Platform => !evicted && !platform_object,
+            _ => platform_object,
+        };
+        if wrong_hierarchy {
+            return Err(Rc::Fmt1(Fmt1::Hierarchy, Some(At::handle(2))));
+        }
+        if !evicted && platform_range != (provision == HierarchyAuth::Platform) {
+            return Err(Rc::Fmt1(Fmt1::Range, Some(At::param(1))));
+        }
+        if evicted {
+            self.persistent.evicted.remove(target);
+            return Ok(());
+        }
+        if self.persistent.evicted.contains(persistent) {
+            return Err(Fmt0::NvDefined.into());
+        }
+        if self.persistent.evicted.len() == object::MAX_PERSISTENT_OBJECTS {
+            return Err(Fmt0::NvSpace.into());
+        }
+        let copy = o.duplicate();
+        self.persistent.evicted.insert(persistent, copy);
+        Ok(())
+    }
+
+    /// Every transient slot is taken, counting those this command's persistent objects borrow.
+    fn slots_full(&self) -> bool {
+        self.stage.objects.loaded_count() + self.stage.borrowed.get() >= object::MAX_LOADED_OBJECTS
+    }
+
+    fn object(&self, l: Loaded) -> &Object {
+        object::get(&self.stage.objects, &self.persistent.evicted, l)
     }
 
     /// Checks that an entity handle names something present; returns the object it names, if
@@ -964,14 +1083,14 @@ impl Tpm<Running> {
 
     fn name_of_object(&self, o: Option<Loaded>) -> Name2b {
         match o {
-            Some(l) => self.stage.objects.get(l).name(),
+            Some(l) => self.object(l).name(),
             None => handle_name(crate::handle::rh::NULL),
         }
     }
 
     fn entity_name(&self, e: EntityHandle, loaded: Option<Loaded>) -> Name2b {
         match (e, loaded) {
-            (_, Some(l)) => self.stage.objects.get(l).name(),
+            (_, Some(l)) => self.object(l).name(),
             (EntityHandle::Hierarchy(h), None) => handle_name(match h {
                 HierarchyAuth::Owner => crate::handle::rh::OWNER,
                 HierarchyAuth::Endorsement => crate::handle::rh::ENDORSEMENT,
@@ -1028,7 +1147,7 @@ impl Tpm<Running> {
         locality: Locality,
     ) -> Result<(u32, Writer), Rc> {
         let hierarchy = hierarchy.entity();
-        if self.stage.objects.loaded_count() == object::MAX_LOADED_OBJECTS {
+        if self.slots_full() {
             return Err(Warn::ObjectMemory.into());
         }
         object::validate_template(&template, sensitive.data.as_slice().len(), None)
@@ -1109,7 +1228,8 @@ impl Tpm<Running> {
         params: &[u8],
         l: Loaded,
     ) -> Result<Authorized<Loaded>, Rc> {
-        let o = self.stage.objects.get(l);
+        // The object's own fields, so the lockout state can be borrowed mutably beside them.
+        let o = object::get(&self.stage.objects, &self.persistent.evicted, l);
         let a = o.public.attributes;
         let name = o.name();
         let value = AuthValue::from_slice(o.sensitive.auth.as_slice());
@@ -1138,11 +1258,11 @@ impl Tpm<Running> {
         template: crate::types::Public,
         creation: Creation,
     ) -> Result<Writer, Rc> {
-        let p = self.stage.objects.get(parent.entity());
+        let p = self.object(parent.entity());
         if !object::is_parent(p) {
             return Err(Rc::Fmt1(Fmt1::Type, Some(At::handle(1))));
         }
-        if self.stage.objects.loaded_count() == object::MAX_LOADED_OBJECTS {
+        if self.slots_full() {
             return Err(Warn::ObjectMemory.into());
         }
         object::validate_template(&template, sensitive.data.as_slice().len(), Some(p))
@@ -1179,13 +1299,13 @@ impl Tpm<Running> {
         private: object::Private,
         public: crate::types::Public,
     ) -> Result<(u32, Writer), Rc> {
-        if self.stage.objects.loaded_count() == object::MAX_LOADED_OBJECTS {
+        if self.slots_full() {
             return Err(Warn::ObjectMemory.into());
         }
         if private.as_slice().is_empty() {
             return Err(Rc::Fmt1(Fmt1::Size, Some(At::param(1))));
         }
-        let p = self.stage.objects.get(parent.entity());
+        let p = self.object(parent.entity());
         if !object::is_parent(p) {
             return Err(Rc::Fmt1(Fmt1::Type, Some(At::handle(1))));
         }
@@ -1409,7 +1529,7 @@ impl Tpm<Running> {
         scheme: SigScheme,
         ticket: HashCheckTicket,
     ) -> Result<Writer, Rc> {
-        let o = self.stage.objects.get(key);
+        let o = self.object(key);
         let a = o.public.attributes;
         if !a.sign_encrypt() || matches!(o.public.kind, PublicKind::SymCipher(_)) {
             return Err(Rc::Fmt1(Fmt1::Key, Some(At::handle(1))));
@@ -1469,7 +1589,7 @@ impl Tpm<Running> {
         scheme: RsaDecryptScheme,
         label: &[u8],
     ) -> Result<Writer, Rc> {
-        let o = self.stage.objects.get(key);
+        let o = self.object(key);
         let PublicKind::Rsa(r) = &o.public.kind else {
             return Err(Rc::Fmt1(Fmt1::Key, Some(At::handle(1))));
         };
@@ -1528,7 +1648,7 @@ impl Tpm<Running> {
         }
         let salt = match tpm_key {
             Some(k) => {
-                let key = self.stage.objects.get(k);
+                let key = self.object(k);
                 if !matches!(key.public.kind, PublicKind::Ecc(_) | PublicKind::Rsa(_)) {
                     return Err(Rc::Fmt1(Fmt1::Key, Some(At::handle(1))));
                 }
@@ -1574,7 +1694,7 @@ impl Tpm<Running> {
         let bind_auth = match (bind, bind_loaded) {
             (EntityHandle::Null, _) => None,
             (_, Some(l)) => {
-                let o = self.stage.objects.get(l);
+                let o = self.object(l);
                 let da = if o.public.attributes.no_da() { Da::Exempt } else { Da::Protected };
                 Some((o.name(), AuthValue::from_slice(o.sensitive.auth.as_slice()), da))
             }
@@ -1619,7 +1739,7 @@ impl Tpm<Running> {
                     self.stage.reset.object_sequence.checked_add(1).ok_or(Fmt0::TooManyContexts)?;
                 self.stage.reset.object_sequence = sequence;
                 let context = if let Some(l) = self.stage.objects.find(h) {
-                    let o = self.stage.objects.get(l);
+                    let o = self.object(l);
                     let saved_handle = if o.public.attributes.st_clear() {
                         SavedHandle::StClear
                     } else {

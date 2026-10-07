@@ -56,6 +56,15 @@ impl HierarchyAuth {
             _ => None,
         }
     }
+
+    pub const fn handle(self) -> u32 {
+        match self {
+            HierarchyAuth::Owner => rh::OWNER,
+            HierarchyAuth::Endorsement => rh::ENDORSEMENT,
+            HierarchyAuth::Platform => rh::PLATFORM,
+            HierarchyAuth::Lockout => rh::LOCKOUT,
+        }
+    }
 }
 
 /// The target of `TPM2_PCR_Extend` (`TPMI_DH_PCR+`): a PCR, or `TPM_RH_NULL`, for which the

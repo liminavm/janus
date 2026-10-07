@@ -352,6 +352,48 @@ SABOTAGES = [
         "                let reset = c.reset;\n                (Pcrs::resume(",
         "the_clock_runs_while_the_tpm_does_and_time_since_init",
     ),
+    (
+        "a persistent object borrows no transient slot",
+        "src/tpm.rs",
+        "                self.stage.borrowed.set(self.stage.borrowed.get() + 1);\n",
+        "",
+        "evict_control_refuses_in_the_reference_order",
+    ),
+    (
+        "a missing persistent handle is HANDLE even with no free slot",
+        "src/tpm.rs",
+        "                if self.slots_full() {\n                    return Err(Warn::ObjectMemory.into());\n                }\n                let l = self\n",
+        "                let l = self\n",
+        "evict_control_refuses_in_the_reference_order",
+    ),
+    (
+        "a NULL-hierarchy object can be made persistent",
+        "src/tpm.rs",
+        "        if o.hierarchy == Hierarchy::Null || o.public.attributes.st_clear() {",
+        "        if o.public.attributes.st_clear() {",
+        "evict_control_refuses_in_the_reference_order",
+    ),
+    (
+        "a persistent object can be evicted to another handle",
+        "src/tpm.rs",
+        "        if evicted && target.handle() != persistent {",
+        "        if false && evicted && target.handle() != persistent {",
+        "evict_control_refuses_in_the_reference_order",
+    ),
+    (
+        "the persistent store has no limit",
+        "src/tpm.rs",
+        "        if self.persistent.evicted.len() == object::MAX_PERSISTENT_OBJECTS {",
+        "        if false {",
+        "evict_control_refuses_in_the_reference_order",
+    ),
+    (
+        "a persistent object does not survive a reset",
+        "src/tpm.rs",
+        "        let copy = o.duplicate();\n        self.persistent.evicted.insert(persistent, copy);",
+        "        let copy = o.duplicate();\n        self.stage.objects.insert(copy);",
+        "a_secret_sealed_under_a_persistent_key_unseals_after_a_reset",
+    ),
 ]
 
 

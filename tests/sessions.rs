@@ -1061,3 +1061,132 @@ fn a_hash_sequence_survives_its_context_and_tickets_what_a_restricted_key_signs(
     let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x186, &[], None, &params));
     assert_eq!(rc(&rsp), 0x2C3);
 }
+
+fn evict(tpm: &mut Janus<Recorder>, auth: u32, object: u32, persistent: u32) -> u32 {
+    let c = command(0x8002, 0x120, &[auth, object], Some(&pw_area()), &persistent.to_be_bytes());
+    rc(&tpm.execute(Locality::ZERO, &c))
+}
+
+fn read_public(tpm: &mut Janus<Recorder>, h: u32) -> Vec<u8> {
+    tpm.execute(Locality::ZERO, &command(0x8001, 0x173, &[h], None, &[]))
+}
+
+fn flush(tpm: &mut Janus<Recorder>, h: u32) {
+    let c = command(0x8001, 0x165, &[], None, &h.to_be_bytes());
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &c)), 0, "FlushContext {h:#x}");
+}
+
+/// TPM2_GetCapability(HANDLES, 0x81000000).
+fn persistent_handles(tpm: &mut Janus<Recorder>) -> Vec<u32> {
+    let params = [1u32, 0x8100_0000, 16].map(u32::to_be_bytes).concat();
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8001, 0x17A, &[], None, &params));
+    assert_eq!(rc(&rsp), 0);
+    (0..u32_at(&rsp, 15) as usize).map(|i| u32_at(&rsp, 19 + 4 * i)).collect()
+}
+
+/// TPM2_Create under `parent` with an empty authValue; returns the private and public areas,
+/// each as its TPM2B.
+fn create_blob(tpm: &mut Janus<Recorder>, parent: u32, template: &str) -> (u32, Vec<u8>) {
+    let params =
+        [tpm2b(&[0, 0, 0, 0]), tpm2b(&hex(template)), vec![0, 0], vec![0, 0, 0, 0]].concat();
+    let rsp =
+        tpm.execute(Locality::ZERO, &command(0x8002, 0x153, &[parent], Some(&pw_area()), &params));
+    if rc(&rsp) != 0 {
+        return (rc(&rsp), Vec::new());
+    }
+    let n = u16_at(&rsp, 14) as usize;
+    let m = u16_at(&rsp, 16 + n) as usize;
+    (0, rsp[14..18 + n + m].to_vec())
+}
+
+const SRK: u32 = 0x8100_0001;
+
+#[test]
+fn a_secret_sealed_under_a_persistent_key_unseals_after_a_reset() {
+    let (mut tpm, _) = started();
+    let (srk, public) = primary(&mut tpm, RH_OWNER, KERNEL_TEMPLATE);
+    assert_eq!(evict(&mut tpm, RH_OWNER, srk, SRK), 0);
+    flush(&mut tpm, srk);
+    assert_eq!(persistent_handles(&mut tpm), [SRK]);
+    // The persistent object is the same object: the same public area.
+    let rsp = read_public(&mut tpm, SRK);
+    assert_eq!(rc(&rsp), 0);
+    assert_eq!(rsp[12..12 + public.len()], public[..]);
+
+    // Sealed under the persistent key, as systemd-cryptenroll does (tests/corpus/03).
+    let (item, _, private, sealed) = seal(&mut tpm, SRK, b"pw", &[], b"volume key", USER_WITH_AUTH);
+    flush(&mut tpm, item);
+
+    // A TPM Reset: everything transient is gone, the persistent key is not.
+    let shutdown = [0x80, 0x01, 0, 0, 0, 0x0C, 0, 0, 0x01, 0x45, 0, 0];
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &shutdown)), 0, "Shutdown");
+    tpm.init();
+    let startup = [0x80, 0x01, 0, 0, 0, 0x0C, 0, 0, 0x01, 0x44, 0, 0];
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup)), 0);
+    assert_eq!(persistent_handles(&mut tpm), [SRK]);
+    let params = [tpm2b(&private), tpm2b(&sealed)].concat();
+    let load = command(0x8002, 0x157, &[SRK], Some(&pw_area()), &params);
+    let rsp = tpm.execute(Locality::ZERO, &load);
+    assert_eq!(rc(&rsp), 0, "Load under the persistent key");
+    let item = u32_at(&rsp, 10);
+    let unseal_pw = [RS_PW.to_be_bytes().to_vec(), vec![0, 0, 0, 0, 2], b"pw".to_vec()].concat();
+    let rsp = tpm.execute(Locality::ZERO, &command(0x8002, 0x15E, &[item], Some(&unseal_pw), &[]));
+    assert_eq!(rc(&rsp), 0, "Unseal");
+    assert_eq!(rsp[16..26], *b"volume key");
+
+    // EvictControl of the persistent object at its own handle removes it.
+    assert_eq!(evict(&mut tpm, RH_OWNER, SRK, SRK), 0);
+    assert_eq!(persistent_handles(&mut tpm), []);
+    // A persistent handle that names nothing: TPM_RC_HANDLE on the handle.
+    assert_eq!(rc(&read_public(&mut tpm, SRK)), 0x18B);
+}
+
+#[test]
+fn evict_control_refuses_in_the_reference_order() {
+    let (mut tpm, _) = started();
+    let (srk, _) = primary(&mut tpm, RH_OWNER, KERNEL_TEMPLATE);
+    // TPMI_DH_PERSISTENT: VALUE on the parameter.
+    assert_eq!(evict(&mut tpm, RH_OWNER, srk, 0x8000_0000), 0x1C4);
+    // TPMI_RH_PROVISION: VALUE on the first handle.
+    assert_eq!(evict(&mut tpm, 0x4000_000B, srk, SRK), 0x184);
+    // The owner's handles are below 0x81800000: RANGE on the parameter.
+    assert_eq!(evict(&mut tpm, RH_OWNER, srk, 0x8180_0000), 0x1CD);
+    // The platform may not persist an owner object: HIERARCHY on the object.
+    assert_eq!(evict(&mut tpm, 0x4000_000C, srk, 0x8180_0000), 0x285);
+    // A NULL-hierarchy object cannot outlive a reset: ATTRIBUTES on the object.
+    let (null, _) = primary(&mut tpm, RH_NULL, KERNEL_TEMPLATE);
+    assert_eq!(evict(&mut tpm, RH_OWNER, null, SRK), 0x282);
+    flush(&mut tpm, null);
+    // A handle in use: TPM_RC_NV_DEFINED.
+    assert_eq!(evict(&mut tpm, RH_OWNER, srk, SRK), 0);
+    assert_eq!(evict(&mut tpm, RH_OWNER, srk, SRK), 0x14C);
+    // A persistent object named by another handle: HANDLE on the object.
+    assert_eq!(evict(&mut tpm, RH_OWNER, SRK, SRK + 1), 0x28B);
+    // Seven persistent objects at most: TPM_RC_NV_SPACE.
+    for i in 1..7 {
+        assert_eq!(evict(&mut tpm, RH_OWNER, srk, SRK + i), 0, "{i}");
+    }
+    assert_eq!(evict(&mut tpm, RH_OWNER, srk, SRK + 7), 0x14B);
+    flush(&mut tpm, srk);
+
+    // A persistent object takes a free transient slot for the command, as the reference
+    // copies it into one (`ObjectLoadEvict`).
+    let (code, blob) = create_blob(&mut tpm, SRK, ECC_KEY_TEMPLATE);
+    assert_eq!(code, 0);
+    let (a, _) = primary(&mut tpm, RH_NULL, KERNEL_TEMPLATE);
+    let (b, _) = primary(&mut tpm, RH_NULL, KERNEL_TEMPLATE);
+    // Two slots taken: naming the persistent key fills the third, and Create or Load has no
+    // room for its own object.
+    assert_eq!(rc(&read_public(&mut tpm, SRK)), 0);
+    assert_eq!(create_blob(&mut tpm, SRK, ECC_KEY_TEMPLATE).0, 0x902);
+    let load = command(0x8002, 0x157, &[SRK], Some(&pw_area()), &blob);
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &load)), 0x902);
+    // Three taken: naming it at all is TPM_RC_OBJECT_MEMORY, before TPM_RC_HANDLE.
+    let (c, _) = primary(&mut tpm, RH_NULL, KERNEL_TEMPLATE);
+    assert_eq!(rc(&read_public(&mut tpm, SRK)), 0x902);
+    assert_eq!(rc(&read_public(&mut tpm, 0x8100_0100)), 0x902);
+    for h in [a, b, c] {
+        flush(&mut tpm, h);
+    }
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &load)), 0);
+}

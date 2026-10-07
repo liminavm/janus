@@ -109,6 +109,20 @@ impl Object {
     pub fn name(&self) -> Name2b {
         self.public.name()
     }
+
+    /// A second copy, for `TPM2_EvictControl`, which leaves the transient object loaded. Made
+    /// through the marshalled form a saved context carries, so the copy has passed the checks
+    /// any object read back must pass. (`Object` has no `Clone`: key material is copied only on
+    /// purpose.)
+    pub fn duplicate(&self) -> Object {
+        let mut w = Writer::new();
+        self.write(&mut w);
+        let bytes = Zeroizing::new(w.into_vec());
+        let mut r = Reader::new(&bytes);
+        let o = Object::read(&mut r).expect("an object reads back what it wrote");
+        r.finish().expect("an object reads back exactly what it wrote");
+        o
+    }
 }
 
 /// Why a public area cannot be created, as `TPMT_PUBLIC` validation reports it: a format-1
@@ -636,14 +650,84 @@ pub struct Objects {
     slots: [Option<Occupant>; MAX_LOADED_OBJECTS],
 }
 
-/// A handle of a loaded key or sealed object. Only [`Objects`] makes one, by finding such an
-/// object, so a handler holding one knows the object was there when the command started.
+/// A handle of a loaded key or sealed object, transient or persistent. Only [`Objects`] and
+/// [`Evicted`] make one, by finding such an object, so a handler holding one knows the object
+/// was there when the command started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Loaded(usize);
+pub struct Loaded(Place);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    Slot(usize),
+    Persistent(u32),
+}
 
 impl Loaded {
     pub fn handle(self) -> u32 {
-        TRANSIENT_FIRST + self.0 as u32
+        match self.0 {
+            Place::Slot(s) => TRANSIENT_FIRST + s as u32,
+            Place::Persistent(h) => h,
+        }
+    }
+
+    pub fn is_persistent(self) -> bool {
+        matches!(self.0, Place::Persistent(_))
+    }
+}
+
+/// The object `l` names, in whichever store holds it.
+pub fn get<'a>(objects: &'a Objects, evicted: &'a Evicted, l: Loaded) -> &'a Object {
+    match l.0 {
+        Place::Slot(s) => match &objects.slots[s] {
+            Some(Occupant::Key(o)) => o,
+            _ => unreachable!("a Loaded handle names a slot holding an object"),
+        },
+        Place::Persistent(h) => {
+            evicted.objects.get(&h).expect("a Loaded handle names a persistent object")
+        }
+    }
+}
+
+/// The first platform persistent handle (`PLATFORM_PERSISTENT`).
+pub const PLATFORM_PERSISTENT: u32 = 0x8180_0000;
+/// Persistent objects janus keeps (`TPM_PT_HR_PERSISTENT_MIN`). An eighth is
+/// `TPM_RC_NV_SPACE`.
+pub const MAX_PERSISTENT_OBJECTS: usize = 7;
+
+/// Objects made persistent by `TPM2_EvictControl`, by handle. They survive every reset.
+#[derive(Default)]
+pub struct Evicted {
+    objects: std::collections::BTreeMap<u32, Box<Object>>,
+}
+
+impl Evicted {
+    pub fn find(&self, h: u32) -> Option<Loaded> {
+        self.objects.contains_key(&h).then_some(Loaded(Place::Persistent(h)))
+    }
+
+    pub fn contains(&self, h: u32) -> bool {
+        self.objects.contains_key(&h)
+    }
+
+    pub fn len(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// Makes `o` persistent at `h`. The caller has checked `h` is free and the store not full.
+    pub fn insert(&mut self, h: u32, o: Object) {
+        debug_assert!(!self.objects.contains_key(&h) && self.len() < MAX_PERSISTENT_OBJECTS);
+        self.objects.insert(h, Box::new(o));
+    }
+
+    pub fn remove(&mut self, l: Loaded) {
+        if let Place::Persistent(h) = l.0 {
+            self.objects.remove(&h);
+        }
+    }
+
+    /// The persistent handles at or above `from`, in order.
+    pub fn handles_from(&self, from: u32) -> Vec<u32> {
+        self.objects.range(from..).map(|(h, _)| *h).collect()
     }
 }
 
@@ -670,7 +754,7 @@ impl Objects {
     /// or its slot is empty or holds a sequence.
     pub fn find(&self, h: u32) -> Option<Loaded> {
         let slot = slot_of(h)?;
-        matches!(self.slots[slot], Some(Occupant::Key(_))).then_some(Loaded(slot))
+        matches!(self.slots[slot], Some(Occupant::Key(_))).then_some(Loaded(Place::Slot(slot)))
     }
 
     /// The running sequence `h` names, likewise.
@@ -682,13 +766,6 @@ impl Objects {
     /// Whether anything is loaded under `h`.
     pub fn is_occupied(&self, h: u32) -> bool {
         slot_of(h).is_some_and(|s| self.slots[s].is_some())
-    }
-
-    pub fn get(&self, l: Loaded) -> &Object {
-        match &self.slots[l.0] {
-            Some(Occupant::Key(o)) => o,
-            _ => unreachable!("a Loaded handle names a slot holding an object"),
-        }
     }
 
     pub fn sequence(&self, s: SequenceSlot) -> &HashSequence {
@@ -708,7 +785,7 @@ impl Objects {
     /// Puts `o` in the lowest free slot; `None` when every slot is taken
     /// (`TPM_RC_OBJECT_MEMORY`).
     pub fn insert(&mut self, o: Object) -> Option<Loaded> {
-        self.place(Occupant::Key(Box::new(o))).map(Loaded)
+        self.place(Occupant::Key(Box::new(o))).map(|s| Loaded(Place::Slot(s)))
     }
 
     pub fn insert_sequence(&mut self, q: HashSequence) -> Option<SequenceSlot> {

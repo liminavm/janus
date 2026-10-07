@@ -5,6 +5,7 @@
 /// An implemented command. A `TPM_CC` outside this enum is `TPM_RC_COMMAND_CODE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Cc {
+    EvictControl,
     HierarchyChangeAuth,
     CreatePrimary,
     SequenceComplete,
@@ -40,7 +41,8 @@ pub enum Cc {
 }
 
 /// The implemented commands in `TPM_CC` order, which is the order `TPM_CAP_COMMANDS` lists them.
-pub const IMPLEMENTED: [Cc; 32] = [
+pub const IMPLEMENTED: [Cc; 33] = [
+    Cc::EvictControl,
     Cc::HierarchyChangeAuth,
     Cc::CreatePrimary,
     Cc::SequenceComplete,
@@ -111,6 +113,7 @@ const NONE: Attributes = Attributes {
 impl Cc {
     pub const fn code(self) -> u32 {
         match self {
+            Cc::EvictControl => 0x120,
             Cc::HierarchyChangeAuth => 0x129,
             Cc::CreatePrimary => 0x131,
             Cc::SequenceComplete => 0x13E,
@@ -156,6 +159,7 @@ impl Cc {
             Cc::HierarchyChangeAuth => {
                 Attributes { nv: true, handles: 1, auth_handles: 1, decrypt: true, ..NONE }
             }
+            Cc::EvictControl => Attributes { nv: true, handles: 2, auth_handles: 1, ..NONE },
             Cc::CreatePrimary => Attributes {
                 handles: 1,
                 auth_handles: 1,

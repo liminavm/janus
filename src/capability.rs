@@ -6,7 +6,7 @@ use crate::alg::{HASHES, MAX_DIGEST};
 use crate::cc::IMPLEMENTED;
 use crate::context::{MAX_OBJECT_CONTEXT, MAX_SESSION_CONTEXT};
 use crate::handle::{ht, rh};
-use crate::object::MAX_LOADED_OBJECTS;
+use crate::object::{MAX_LOADED_OBJECTS, MAX_PERSISTENT_OBJECTS};
 use crate::pcr::{self, PCR_COUNT, PCR_SELECT_SIZE, Selection};
 use crate::rc::{At, Fmt1, Rc};
 use crate::session::{CONTEXT_GAP_MAX, MAX_ACTIVE_SESSIONS, MAX_LOADED_SESSIONS};
@@ -52,6 +52,8 @@ pub struct Variable {
     pub orderly: bool,
     /// Loaded transient objects' handles, in order.
     pub transient: Vec<u32>,
+    /// Persistent objects' handles, in order.
+    pub persistent: Vec<u32>,
     /// Loaded sessions' handles, in order.
     pub loaded_sessions: Vec<u32>,
     /// Saved sessions' handles, in order.
@@ -80,7 +82,7 @@ const FIXED: &[(u32, u32)] = &[
     (0x10C, 0),                             // FIRMWARE_VERSION_2
     (0x10D, 1024),                          // INPUT_BUFFER
     (0x10E, MAX_LOADED_OBJECTS as u32),     // HR_TRANSIENT_MIN
-    (0x10F, 7),                             // HR_PERSISTENT_MIN
+    (0x10F, MAX_PERSISTENT_OBJECTS as u32), // HR_PERSISTENT_MIN
     (0x110, MAX_LOADED_SESSIONS as u32),    // HR_LOADED_MIN
     (0x111, MAX_ACTIVE_SESSIONS as u32),    // ACTIVE_SESSIONS_MAX
     (0x112, PCR_COUNT as u32),              // PCR_COUNT
@@ -122,21 +124,22 @@ fn variable(v: &Variable) -> Vec<(u32, u32)> {
     let loaded = v.loaded_sessions.len() as u32;
     let active = loaded + v.saved_sessions.len() as u32;
     let transient = v.transient.len() as u32;
+    let persistent = v.persistent.len() as u32;
     vec![
-        (0x200, permanent),                             // PERMANENT
-        (0x201, startup_clear),                         // STARTUP_CLEAR
-        (0x202, 0),                                     // HR_NV_INDEX
-        (0x203, loaded),                                // HR_LOADED
-        (0x204, MAX_LOADED_SESSIONS as u32 - loaded),   // HR_LOADED_AVAIL
-        (0x205, active),                                // HR_ACTIVE
-        (0x206, MAX_ACTIVE_SESSIONS as u32 - active),   // HR_ACTIVE_AVAIL
-        (0x207, MAX_LOADED_OBJECTS as u32 - transient), // HR_TRANSIENT_AVAIL
-        (0x208, 0),                                     // HR_PERSISTENT
-        (0x209, 7),                                     // HR_PERSISTENT_AVAIL
-        (0x20A, 0),                                     // NV_COUNTERS
-        (0x20B, 0),                                     // NV_COUNTERS_AVAIL
-        (0x20C, 0),                                     // ALGORITHM_SET
-        (0x20D, 0),                                     // LOADED_CURVES
+        (0x200, permanent),                                  // PERMANENT
+        (0x201, startup_clear),                              // STARTUP_CLEAR
+        (0x202, 0),                                          // HR_NV_INDEX
+        (0x203, loaded),                                     // HR_LOADED
+        (0x204, MAX_LOADED_SESSIONS as u32 - loaded),        // HR_LOADED_AVAIL
+        (0x205, active),                                     // HR_ACTIVE
+        (0x206, MAX_ACTIVE_SESSIONS as u32 - active),        // HR_ACTIVE_AVAIL
+        (0x207, MAX_LOADED_OBJECTS as u32 - transient),      // HR_TRANSIENT_AVAIL
+        (0x208, persistent),                                 // HR_PERSISTENT
+        (0x209, MAX_PERSISTENT_OBJECTS as u32 - persistent), // HR_PERSISTENT_AVAIL
+        (0x20A, 0),                                          // NV_COUNTERS
+        (0x20B, 0),                                          // NV_COUNTERS_AVAIL
+        (0x20C, 0),                                          // ALGORITHM_SET
+        (0x20D, 0),                                          // LOADED_CURVES
     ]
 }
 
@@ -193,7 +196,8 @@ pub fn get(
                 // session handle types in this capability.
                 ht::HMAC_SESSION => from(&v.loaded_sessions),
                 ht::POLICY_SESSION => from(&v.saved_sessions),
-                ht::NV_INDEX | ht::PERSISTENT => Vec::new(),
+                ht::PERSISTENT => from(&v.persistent),
+                ht::NV_INDEX => Vec::new(),
                 _ => return Err(Rc::Fmt1(Fmt1::Value, Some(At::param(2)))),
             };
             emit(w, capability, count.min(MAX_CAP_HANDLES), handles.iter(), |w, h| w.u32(*h));

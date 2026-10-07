@@ -56,8 +56,8 @@ fn run(tpm: &mut Janus<Fixed>, cmd: &[u8]) -> Vec<u8> {
 }
 
 /// A started TPM holding what the context and session paths need to be reachable: a primary
-/// key at 0x80000000, an HMAC session at 0x02000000, and, saved and out of memory, another
-/// primary key and another session. Returns the TPM and the two saved `TPMS_CONTEXT`s, which
+/// key at 0x80000000, an owner key made persistent at 0x81000001, an HMAC session at
+/// 0x02000000, and, saved and out of memory, another primary key and another session. Returns the TPM and the two saved `TPMS_CONTEXT`s, which
 /// are the same on every run because [`Fixed`] is.
 pub fn prepared() -> (Janus<Fixed>, Vec<Vec<u8>>) {
     let mut tpm = Janus::manufacture(Fixed);
@@ -81,6 +81,14 @@ pub fn prepared() -> (Janus<Fixed>, Vec<Vec<u8>>) {
     run(&mut tpm, &create);
     run(&mut tpm, &create);
     let object = run(&mut tpm, &save(0x8000_0001))[10..].to_vec();
+    run(&mut tpm, &flush(0x8000_0001));
+    let owner = [&0x4000_0001u32.to_be_bytes()[..], &create[14..]].concat();
+    run(&mut tpm, &command(0x8002, 0x131, &owner));
+    let mut evict = 0x4000_0001u32.to_be_bytes().to_vec();
+    evict.extend_from_slice(&0x8000_0001u32.to_be_bytes());
+    evict.extend_from_slice(&[0, 0, 0, 9, 0x40, 0, 0, 9, 0, 0, 1, 0, 0]);
+    evict.extend_from_slice(&0x8100_0001u32.to_be_bytes());
+    run(&mut tpm, &command(0x8002, 0x120, &evict));
     run(&mut tpm, &flush(0x8000_0001));
     run(&mut tpm, &session);
     run(&mut tpm, &session);

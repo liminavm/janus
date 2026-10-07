@@ -66,6 +66,12 @@ Each property is held by the cheapest checker that can hold it, and every checke
   into a TPM already holding a key, a session and saved contexts). Every response must be a
   well-formed frame. Seed the corpora from the guest captures first:
   `cargo run --manifest-path fuzz/Cargo.toml --bin seed-corpora`.
+- Miri — `RUSTFLAGS='--cfg sha2_backend="soft"' cargo +nightly miri test --lib` and
+  `--test commands` (about 1.5 h together; cap them). The unsafe code is all in dependencies,
+  and these are the suites that reach it without generating RSA keys, which Miri cannot finish;
+  `sessions`, `replay` and the walks stay out. The flag picks sha2's portable backend: sha2
+  0.11.0's aarch64 one reads 16 bytes through a reference to one `u32`, which Stacked Borrows
+  rejects (fixed upstream, unreleased); drop it once a release carries the fix.
 - `harness/sabotage/sweep.py` — breaks each guarded property on purpose and checks its witness
   goes red. A new guard gets an entry; an entry that survives is a hole.
 

@@ -62,7 +62,7 @@ impl ToTest {
         self.test_against(families, &VECTORS, platform);
     }
 
-    fn test_against(&mut self, families: &[Family], v: &Vectors, platform: &mut impl Platform) {
+    fn test_against(&mut self, families: &[Family], v: &Vectors<'_>, platform: &mut impl Platform) {
         for f in families {
             if self.untested & f.bit() == 0 {
                 continue;
@@ -178,27 +178,27 @@ fn failure() -> Vec<u8> {
     r
 }
 
-struct Vectors {
-    sha256_abc: &'static str,
-    hmac_jefe: &'static str,
-    kdfa: &'static str,
-    kdfe: &'static str,
-    aes_cfb: &'static str,
-    ecc_x: &'static str,
-    ecc_ux: &'static str,
-    ecc_uy: &'static str,
-    ecdsa_r: &'static str,
-    ecdsa_s: &'static str,
-    ecdh_k: &'static str,
-    ecdh_zx: &'static str,
-    rsa_n: &'static str,
-    rsa_p: &'static str,
-    rsa_c: &'static str,
-    rsa_m: &'static str,
-    rsa_sig: &'static str,
+struct Vectors<'a> {
+    sha256_abc: &'a str,
+    hmac_jefe: &'a str,
+    kdfa: &'a str,
+    kdfe: &'a str,
+    aes_cfb: &'a str,
+    ecc_x: &'a str,
+    ecc_ux: &'a str,
+    ecc_uy: &'a str,
+    ecdsa_r: &'a str,
+    ecdsa_s: &'a str,
+    ecdh_k: &'a str,
+    ecdh_zx: &'a str,
+    rsa_n: &'a str,
+    rsa_p: &'a str,
+    rsa_c: &'a str,
+    rsa_m: &'a str,
+    rsa_sig: &'a str,
 }
 
-const VECTORS: Vectors = Vectors {
+const VECTORS: Vectors<'static> = Vectors {
     sha256_abc: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
     hmac_jefe: "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
     kdfa: "f6b95c3e4594c40a562d4a54efb69c7ef948839e5ddbf9635231e642d10c23e6\
@@ -266,7 +266,7 @@ fn hex(s: &str) -> Vec<u8> {
 }
 
 /// Whether `family` gives every answer `v` holds.
-fn check(family: Family, v: &Vectors, platform: &mut impl Platform) -> bool {
+fn check(family: Family, v: &Vectors<'_>, platform: &mut impl Platform) -> bool {
     match family {
         Family::Hash => {
             let sha = Hash::Sha256.digest(&[b"abc"]);
@@ -362,7 +362,7 @@ mod tests {
     /// Each vector is compared: one wrong digit in any of them fails its family.
     #[test]
     fn a_wrong_expected_answer_fails_its_family() {
-        type Field = fn(&mut Vectors) -> &mut &'static str;
+        type Field = for<'a, 'b> fn(&'b mut Vectors<'a>) -> &'b mut &'a str;
         let fields: [(Family, Field); 17] = [
             (Family::Hash, |v| &mut v.sha256_abc),
             (Family::Hash, |v| &mut v.hmac_jefe),
@@ -383,13 +383,14 @@ mod tests {
             (Family::Rsa, |v| &mut v.rsa_sig),
         ];
         for (k, (family, field)) in fields.into_iter().enumerate() {
-            let mut v = VECTORS;
-            let wrong: String = field(&mut v)
+            let mut right = VECTORS;
+            let wrong: String = field(&mut right)
                 .chars()
                 .enumerate()
                 .map(|(i, c)| if i == 3 { if c == '0' { '1' } else { '0' } } else { c })
                 .collect();
-            *field(&mut v) = Box::leak(wrong.into_boxed_str());
+            let mut v = VECTORS;
+            *field(&mut v) = &wrong;
             assert!(!check(family, &v, &mut Zero), "vector {k} of {family:?}");
         }
     }

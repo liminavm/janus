@@ -162,10 +162,12 @@ pub struct Tpm<S> {
     stage: S,
 }
 
-/// Platform clock readings: the last one `Clock` was advanced to, and the one at `_TPM_Init`.
+/// The last platform clock reading `Clock` was advanced to, and `Time` as of it. `Time` is kept
+/// rather than the reading at `_TPM_Init` so a TPM resumed on a platform whose clock started
+/// again goes on from where it stood.
 struct Clocks {
     last: u64,
-    init_at: u64,
+    time: u64,
 }
 
 /// `Clock` is saved to NV when it crosses a multiple of 2^22 ms (`NV_CLOCK_UPDATE_INTERVAL`).
@@ -175,12 +177,13 @@ impl<S> Tpm<S> {
     /// Advances `Clock` to the platform's `now`.
     /// `Time`: milliseconds since `_TPM_Init`.
     fn time(&self) -> u64 {
-        self.clocks.last.saturating_sub(self.clocks.init_at)
+        self.clocks.time
     }
 
     fn tick(&mut self, now: u64) {
         let elapsed = now.saturating_sub(self.clocks.last);
         self.clocks.last = self.clocks.last.max(now);
+        self.clocks.time = self.clocks.time.saturating_add(elapsed);
         let before = self.persistent.clock;
         self.persistent.clock = before.saturating_add(elapsed);
         if self.persistent.clock / CLOCK_SAVE_INTERVAL > before / CLOCK_SAVE_INTERVAL {
@@ -196,6 +199,150 @@ enum Lifecycle {
     Initialized(Box<Tpm<Initialized>>),
     Running(Box<Tpm<Running>>),
     Failure(Box<Tpm<Failure>>),
+}
+
+impl<S> Tpm<S> {
+    /// In a snapshot, what every stage has: the persistent state as it stands (live `Clock`
+    /// as well as the saved one), the lockout with its timers, `Time`, and the self-tests.
+    fn write_common(&self, w: &mut Writer) {
+        let p = &self.persistent;
+        p.secrets.write(w);
+        p.owner_auth.write(w);
+        p.endorsement_auth.write(w);
+        p.lockout_auth.write(w);
+        w.u64(p.reset_count);
+        w.u64(p.clock);
+        p.clock_safe.write(w);
+        w.u64(p.saved_clock.clock);
+        p.saved_clock.safe.write(w);
+        p.evicted.write(w);
+        p.nv.save(w);
+        match &p.orderly {
+            None => w.u8(0),
+            Some(Orderly::Clear) => w.u8(1),
+            Some(Orderly::State(pcrs)) => {
+                w.u8(2);
+                pcrs.save(w);
+            }
+        }
+        self.lockout.write_live(w);
+        w.u64(self.time());
+        self.to_test.write(w);
+    }
+}
+
+fn write_reset(w: &mut Writer, reset: &ResetState) {
+    reset.null.write(w);
+    reset.sessions.write_live(w);
+    w.u32(reset.clear_count);
+    w.u32(reset.restart_count);
+    w.u64(reset.object_sequence);
+}
+
+fn read_reset(r: &mut Reader<'_>) -> Result<ResetState, Fmt1> {
+    Ok(ResetState {
+        null: NullSecrets::read(r)?,
+        sessions: SessionTable::read_live(r)?,
+        clear_count: r.u32()?,
+        restart_count: r.u32()?,
+        object_sequence: r.u64()?,
+    })
+}
+
+fn write_carried(w: &mut Writer, carried: Option<&Carried>) {
+    match carried {
+        None => w.u8(0),
+        Some(c) => {
+            w.u8(1);
+            c.platform_auth.write(w);
+            write_reset(w, &c.reset);
+        }
+    }
+}
+
+/// What a stopped TPM carries for a Restart or Resume: never a loaded session, which
+/// `_TPM_Init` drops.
+fn read_carried(r: &mut Reader<'_>) -> Result<Option<Box<Carried>>, Fmt1> {
+    match r.u8()? {
+        0 => Ok(None),
+        1 => {
+            let platform_auth = AuthValue::read(r)?;
+            let reset = read_reset(r)?;
+            if reset.sessions.has_loaded() {
+                return Err(Fmt1::Value);
+            }
+            Ok(Some(Box::new(Carried { platform_auth, reset })))
+        }
+        _ => Err(Fmt1::Value),
+    }
+}
+
+/// What [`Janus::snapshot`] wrote, with the clock readings re-based on `now`.
+fn read_lifecycle(r: &mut Reader<'_>, now: u64) -> Result<Lifecycle, Fmt1> {
+    let stage = r.u8()?;
+    let secrets = PersistentSecrets::read(r)?;
+    let owner_auth = AuthValue::read(r)?;
+    let endorsement_auth = AuthValue::read(r)?;
+    let lockout_auth = AuthValue::read(r)?;
+    let reset_count = r.u64()?;
+    let clock = r.u64()?;
+    let clock_safe = bool::read(r)?;
+    let saved_clock = SavedClock { clock: r.u64()?, safe: bool::read(r)? };
+    let evicted = Evicted::read(r)?;
+    let nv = NvStore::load(r)?;
+    let orderly = match r.u8()? {
+        0 => None,
+        1 => Some(Orderly::Clear),
+        2 => Some(Orderly::State(Box::new(Pcrs::load(r)?))),
+        _ => return Err(Fmt1::Value),
+    };
+    let lockout = Lockout::read_live(r)?;
+    let time = r.u64()?;
+    let to_test = ToTest::read(r)?;
+    let shut_with_state = matches!(orderly, Some(Orderly::State(_)));
+    let persistent = Persistent {
+        owner_auth,
+        endorsement_auth,
+        lockout_auth,
+        secrets,
+        reset_count,
+        clock,
+        clock_safe,
+        saved_clock,
+        evicted,
+        nv,
+        orderly,
+    };
+    let clocks = Clocks { last: now, time };
+    Ok(match stage {
+        0 => {
+            let carried = read_carried(r)?;
+            // A Shutdown(STATE) saves what a Resume needs; `Janus::state` relies on it.
+            if shut_with_state && carried.is_none() {
+                return Err(Fmt1::Value);
+            }
+            let stage = Initialized { carried };
+            Lifecycle::Initialized(Box::new(Tpm { persistent, clocks, lockout, to_test, stage }))
+        }
+        1 => {
+            let pcrs = Pcrs::load(r)?;
+            let platform_auth = AuthValue::read(r)?;
+            let reset = read_reset(r)?;
+            let objects = Objects::read(r)?;
+            let stage = Running { pcrs, platform_auth, reset, objects, borrowed: Cell::new(0) };
+            Lifecycle::Running(Box::new(Tpm { persistent, clocks, lockout, to_test, stage }))
+        }
+        2 => {
+            let failed = Family::from_location(r.u8()?).ok_or(Fmt1::Value)?;
+            let carried = read_carried(r)?;
+            if shut_with_state && carried.is_none() {
+                return Err(Fmt1::Value);
+            }
+            let stage = Failure { failed, carried };
+            Lifecycle::Failure(Box::new(Tpm { persistent, clocks, lockout, to_test, stage }))
+        }
+        _ => return Err(Fmt1::Value),
+    })
 }
 
 /// A TPM 2.0. The device that owns it delivers each command with the locality it arrived at,
@@ -229,7 +376,7 @@ impl<P: Platform> Janus<P> {
         let now = platform.now_ms();
         let tpm = Tpm {
             persistent,
-            clocks: Clocks { last: now, init_at: now },
+            clocks: Clocks { last: now, time: 0 },
             lockout: Lockout::manufactured(),
             to_test: ToTest::ALL,
             stage: Initialized { carried: None },
@@ -254,7 +401,7 @@ impl<P: Platform> Janus<P> {
         let saved = next.persistent.saved_clock;
         next.persistent.clock = saved.clock;
         next.persistent.clock_safe = saved.safe;
-        next.clocks = Clocks { last: now, init_at: now };
+        next.clocks = Clocks { last: now, time: 0 };
         next.to_test = ToTest::ALL;
         self.lifecycle = Some(Lifecycle::Initialized(next));
     }
@@ -367,12 +514,56 @@ impl<P: Platform> Janus<P> {
         let now = platform.now_ms();
         let tpm = Tpm {
             persistent,
-            clocks: Clocks { last: now, init_at: now },
+            clocks: Clocks { last: now, time: 0 },
             lockout,
             to_test: ToTest::ALL,
             stage: Initialized { carried },
         };
         Ok(Janus { platform, lifecycle: Some(Lifecycle::Initialized(Box::new(tpm))) })
+    }
+
+    /// Everything the TPM holds, volatile state included: the TPM as it stands between two
+    /// commands, for a VMM to keep in a snapshot of the machine and hand to [`Janus::resume`].
+    /// Where [`Janus::state`] is what a power loss would leave, this is what a suspended machine
+    /// resumes with: no `_TPM_Init` and no Startup come in between, as on a platform that keeps
+    /// the TPM powered while it sleeps, so PCRs, loaded objects and sessions are all in it.
+    pub fn snapshot(&self) -> Zeroizing<Vec<u8>> {
+        let mut w = Writer::new();
+        match self.lifecycle.as_ref().expect("the TPM is between stages") {
+            Lifecycle::Initialized(t) => {
+                w.u8(0);
+                t.write_common(&mut w);
+                write_carried(&mut w, t.stage.carried.as_deref());
+            }
+            Lifecycle::Running(t) => {
+                debug_assert_eq!(t.stage.borrowed.get(), 0, "a command is still running");
+                w.u8(1);
+                t.write_common(&mut w);
+                t.stage.pcrs.save(&mut w);
+                t.stage.platform_auth.write(&mut w);
+                write_reset(&mut w, &t.stage.reset);
+                t.stage.objects.write(&mut w);
+            }
+            Lifecycle::Failure(t) => {
+                w.u8(2);
+                t.write_common(&mut w);
+                w.u8(t.stage.failed.location() as u8);
+                write_carried(&mut w, t.stage.carried.as_deref());
+            }
+        }
+        state::frame_snapshot(&Zeroizing::new(w.into_vec()))
+    }
+
+    /// The TPM [`Janus::snapshot`] took, as it stood: the same stage, PCRs, objects and
+    /// sessions, with `Clock` and `Time` going on from where they were however `platform`'s
+    /// clock reads now.
+    pub fn resume(mut platform: P, snapshot: &[u8]) -> Result<Self, StateError> {
+        let body = state::unframe_snapshot(snapshot)?;
+        let mut r = Reader::new(body);
+        let now = platform.now_ms();
+        let lifecycle = read_lifecycle(&mut r, now).map_err(|_| StateError::Invalid)?;
+        r.finish().map_err(|_| StateError::Invalid)?;
+        Ok(Janus { platform, lifecycle: Some(lifecycle) })
     }
 
     /// Executes one command and returns its response. Nothing a guest sends can make this
@@ -784,7 +975,7 @@ impl Tpm<Running> {
                 Reader::new(&params).finish().map_err(Rc::bare)?;
                 // TPMS_TIME_INFO: time, then TPMS_CLOCK_INFO.
                 let mut out = Writer::new();
-                out.u64(self.clocks.last - self.clocks.init_at);
+                out.u64(self.time());
                 out.u64(self.persistent.clock);
                 out.u32(self.persistent.reset_count as u32);
                 out.u32(self.stage.reset.restart_count);

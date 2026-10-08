@@ -64,14 +64,22 @@ fn main() {
         fs::write(prepared.join(format!("context-{i}")), janus_fuzz::context_load_record(c))
             .unwrap();
     }
-    // The prepared TPM's state, running and after Shutdown(STATE), and a new TPM's.
+    // The prepared TPM's state and snapshot, running and after Shutdown(STATE), and a new
+    // TPM's: snapshots of a running TPM hold its loaded key and session.
     let state = root.join("fuzz/corpus/state");
+    let snapshot = root.join("fuzz/corpus/snapshot");
     fs::create_dir_all(&state).unwrap();
-    let new = janus::Janus::manufacture(janus_fuzz::Fixed::new().0).state();
-    fs::write(state.join("manufactured"), janus_fuzz::state_body(&new)).unwrap();
-    fs::write(state.join("running"), janus_fuzz::state_body(&tpm.state())).unwrap();
+    fs::create_dir_all(&snapshot).unwrap();
+    let new = janus::Janus::manufacture(janus_fuzz::Fixed::new().0);
+    let body = janus_fuzz::state_body;
+    fs::write(state.join("manufactured"), body(&new.state())).unwrap();
+    fs::write(snapshot.join("manufactured"), body(&new.snapshot())).unwrap();
+    fs::write(state.join("running"), body(&tpm.state())).unwrap();
+    fs::write(snapshot.join("running"), body(&tpm.snapshot())).unwrap();
     let shutdown_state = [0x80, 0x01, 0, 0, 0, 0x0C, 0, 0, 0x01, 0x45, 0, 1];
     tpm.execute(janus::Locality::ZERO, &shutdown_state);
-    fs::write(state.join("shutdown-state"), janus_fuzz::state_body(&tpm.state())).unwrap();
+    fs::write(state.join("shutdown-state"), body(&tpm.state())).unwrap();
+    tpm.init();
+    fs::write(snapshot.join("shutdown-state"), body(&tpm.snapshot())).unwrap();
     println!("{} commands, sequences from every capture", commands.len());
 }

@@ -1156,6 +1156,25 @@ impl Marshal for Lockout {
     }
 }
 
+impl Lockout {
+    /// In a snapshot: [`Marshal`]'s form, then the timers it leaves out, which a Startup
+    /// restarts but a resumed TPM goes on with.
+    pub fn write_live(&self, w: &mut Writer) {
+        self.write(w);
+        w.u64(self.now);
+        w.u64(self.self_heal_timer);
+        w.u64(self.lockout_timer);
+    }
+
+    pub fn read_live(r: &mut Reader<'_>) -> Result<Lockout, Fmt1> {
+        let mut l = Lockout::read(r)?;
+        l.now = r.u64()?;
+        l.self_heal_timer = r.u64()?;
+        l.lockout_timer = r.u64()?;
+        Ok(l)
+    }
+}
+
 impl Unmarshal for Lockout {
     fn read(r: &mut Reader<'_>) -> Result<Self, Fmt1> {
         Ok(Lockout {
@@ -1190,20 +1209,68 @@ impl Marshal for SessionTable {
     }
 }
 
+impl SessionTable {
+    /// The whole table for a snapshot: [`Marshal`]'s form, but with each loaded session in
+    /// full where that writes a free slot.
+    pub fn write_live(&self, w: &mut Writer) {
+        w.u64(self.next_sequence);
+        for slot in &self.slots {
+            match slot {
+                SessionSlot::Free => w.u8(0),
+                SessionSlot::Saved { sequence, kind } => {
+                    w.u8(1);
+                    w.u64(*sequence);
+                    w.u8(*kind);
+                }
+                SessionSlot::Loaded(s) => {
+                    w.u8(2);
+                    s.write(w);
+                }
+            }
+        }
+    }
+
+    /// What [`SessionTable::write_live`] wrote: no more loaded sessions than the TPM holds.
+    pub fn read_live(r: &mut Reader<'_>) -> Result<Self, Fmt1> {
+        let next_sequence = r.u64()?;
+        let mut slots = Vec::with_capacity(MAX_ACTIVE_SESSIONS);
+        for _ in 0..MAX_ACTIVE_SESSIONS {
+            slots.push(match r.u8()? {
+                0 => SessionSlot::Free,
+                1 => SessionTable::read_saved(r)?,
+                2 => SessionSlot::Loaded(Box::new(Session::read(r)?)),
+                _ => return Err(Fmt1::Value),
+            });
+        }
+        let table = SessionTable { slots, next_sequence };
+        if table.loaded() > MAX_LOADED_SESSIONS {
+            return Err(Fmt1::Size);
+        }
+        Ok(table)
+    }
+
+    /// Whether any session is loaded: none is in a table a Restart or Resume carries.
+    pub fn has_loaded(&self) -> bool {
+        self.loaded() > 0
+    }
+
+    fn read_saved(r: &mut Reader<'_>) -> Result<SessionSlot, Fmt1> {
+        let sequence = r.u64()?;
+        let kind = r.u8()?;
+        if kind != ht::HMAC_SESSION && kind != ht::POLICY_SESSION {
+            return Err(Fmt1::Value);
+        }
+        Ok(SessionSlot::Saved { sequence, kind })
+    }
+}
+
 impl Unmarshal for SessionTable {
     fn read(r: &mut Reader<'_>) -> Result<Self, Fmt1> {
         let next_sequence = r.u64()?;
         let slots = (0..MAX_ACTIVE_SESSIONS)
             .map(|_| match r.u8()? {
                 0 => Ok(SessionSlot::Free),
-                1 => {
-                    let sequence = r.u64()?;
-                    let kind = r.u8()?;
-                    if kind != ht::HMAC_SESSION && kind != ht::POLICY_SESSION {
-                        return Err(Fmt1::Value);
-                    }
-                    Ok(SessionSlot::Saved { sequence, kind })
-                }
+                1 => SessionTable::read_saved(r),
                 _ => Err(Fmt1::Value),
             })
             .collect::<Result<_, _>>()?;

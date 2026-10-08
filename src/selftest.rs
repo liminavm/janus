@@ -13,6 +13,8 @@
 use crate::alg::Hash;
 use crate::cc::Cc;
 use crate::crypto::{self, EccPrivate, EccPublicKey, PlatformRng, RsaDecrypt, RsaPrivate};
+use crate::rc::Fmt1;
+use crate::wire::{Reader, Writer};
 use crate::{Platform, SelfTests};
 
 /// A family of algorithms tested together.
@@ -38,6 +40,11 @@ impl Family {
 
     const fn bit(self) -> u8 {
         1 << self as u8
+    }
+
+    /// The family `location` names.
+    pub fn from_location(location: u8) -> Option<Family> {
+        Family::ALL.into_iter().find(|f| f.location() == u32::from(location))
     }
 }
 
@@ -91,6 +98,24 @@ impl ToTest {
 
     pub fn failed(&self) -> Option<Family> {
         self.failed
+    }
+
+    /// In a snapshot: the untested families, then the one that failed, 0 for none.
+    pub fn write(&self, w: &mut Writer) {
+        w.u8(self.untested);
+        w.u8(self.failed.map_or(0, |f| f as u8));
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<ToTest, Fmt1> {
+        let untested = r.u8()?;
+        if untested & !ToTest::ALL.untested != 0 {
+            return Err(Fmt1::Value);
+        }
+        let failed = match r.u8()? {
+            0 => None,
+            f => Some(Family::from_location(f).ok_or(Fmt1::Value)?),
+        };
+        Ok(ToTest { untested, failed })
     }
 }
 

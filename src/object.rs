@@ -817,6 +817,41 @@ impl Objects {
     }
 }
 
+/// In a snapshot: each slot in order, 0 when free, 1 and the object for a key or sealed data, 2
+/// and the sequence for a hash sequence.
+impl Marshal for Objects {
+    fn write(&self, w: &mut Writer) {
+        for slot in &self.slots {
+            match slot {
+                None => w.u8(0),
+                Some(Occupant::Key(o)) => {
+                    w.u8(1);
+                    o.write(w);
+                }
+                Some(Occupant::Sequence(s)) => {
+                    w.u8(2);
+                    s.write(w);
+                }
+            }
+        }
+    }
+}
+
+impl Unmarshal for Objects {
+    fn read(r: &mut Reader<'_>) -> Result<Self, Fmt1> {
+        let mut objects = Objects::default();
+        for slot in &mut objects.slots {
+            *slot = match r.u8()? {
+                0 => None,
+                1 => Some(Occupant::Key(Box::new(Object::read(r)?))),
+                2 => Some(Occupant::Sequence(Box::new(HashSequence::read(r)?))),
+                _ => return Err(Fmt1::Value),
+            };
+        }
+        Ok(objects)
+    }
+}
+
 /// In the state file: the number of persistent objects, then each one's handle and object.
 impl Marshal for Evicted {
     fn write(&self, w: &mut Writer) {

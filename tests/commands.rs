@@ -1140,3 +1140,108 @@ fn a_reset_count_at_its_limit_wraps() {
     let mut tpm = restored(Zero, &body);
     ok(&mut tpm, &startup(false));
 }
+
+fn pcr_read(pcr: u32) -> Vec<u8> {
+    let mut body = 1u32.to_be_bytes().to_vec();
+    body.extend_from_slice(&0x000Bu16.to_be_bytes());
+    let mut select = [0u8; 3];
+    select[(pcr / 8) as usize] = 1 << (pcr % 8);
+    body.push(3);
+    body.extend_from_slice(&select);
+    cmd(NO_SESSIONS, 0x17E, &body)
+}
+
+/// `TPM2_HashSequenceStart` for SHA-256 with an empty authorization.
+fn hash_sequence_start() -> Vec<u8> {
+    let mut body = tpm2b(b"");
+    body.extend_from_slice(&0x000Bu16.to_be_bytes());
+    cmd(NO_SESSIONS, 0x186, &body)
+}
+
+/// What a client can see of a running TPM: a PCR, the loaded and saved handles of each kind,
+/// and the loaded object's public area.
+fn observed(tpm: &mut Janus<Zero>) -> Vec<Vec<u8>> {
+    let mut seen = vec![ok(tpm, &pcr_read(16))];
+    for first in [0x8000_0000u32, 0x0200_0000, 0x0300_0000] {
+        seen.push(ok(tpm, &cmd(NO_SESSIONS, 0x17A, &get_capability(1, first, 64))));
+    }
+    seen.push(ok(tpm, &cmd(NO_SESSIONS, 0x173, &0x8000_0000u32.to_be_bytes())));
+    seen
+}
+
+/// A snapshot taken mid-run resumes as the same running TPM: its PCRs, loaded object, hash
+/// sequence and sessions, loaded and saved, are where they were, and it answers commands with
+/// no Startup. It saves back to the same snapshot and the same state file.
+#[test]
+fn a_snapshot_resumes_the_tpm_mid_run() {
+    let mut tpm = started();
+    ok(&mut tpm, &extend(16));
+    ok(&mut tpm, &create_primary(NULL, &PARENT));
+    ok(&mut tpm, &hash_sequence_start());
+    let r = ok(&mut tpm, &plain_session());
+    let loaded = u32::from_be_bytes(r[10..14].try_into().unwrap());
+    let r = ok(&mut tpm, &plain_session());
+    let other = u32::from_be_bytes(r[10..14].try_into().unwrap());
+    let session = saved(&mut tpm, other);
+    let before = observed(&mut tpm);
+    let snapshot = tpm.snapshot();
+    let state = tpm.state();
+
+    let mut resumed = Janus::resume(Zero, &snapshot).expect("the snapshot resumes");
+    assert_eq!(&resumed.snapshot()[..], &snapshot[..], "it snapshots back differently");
+    assert_eq!(&resumed.state()[..], &state[..], "it saves a different state file");
+    assert_eq!(observed(&mut resumed), before);
+    ok(&mut resumed, &context_load(&session));
+    ok(&mut resumed, &flush(loaded));
+    ok(&mut resumed, &context_save(0x8000_0000));
+    // The sequence is still running: it completes.
+    let mut complete = 0x8000_0001u32.to_be_bytes().to_vec();
+    complete.extend(area(&[password(b"")]));
+    complete.extend(tpm2b(b"abc"));
+    complete.extend_from_slice(&NULL.to_be_bytes());
+    ok(&mut resumed, &cmd(SESSIONS, 0x13E, &complete));
+}
+
+/// A TPM between `_TPM_Init` and Startup resumes there: after a Shutdown(STATE), the Startup
+/// that follows the resume is still a Resume, which brings back the state-saved PCRs (8, not
+/// the debug PCR 16, which every Startup resets).
+#[test]
+fn a_snapshot_between_init_and_startup_resumes_there() {
+    let mut tpm = started();
+    ok(&mut tpm, &extend(8));
+    let pcr = ok(&mut tpm, &pcr_read(8));
+    ok(&mut tpm, &shutdown(true));
+    tpm.init();
+    let mut resumed = Janus::resume(Zero, &tpm.snapshot()).expect("the snapshot resumes");
+    assert_eq!(run(&mut resumed, &pcr_read(8)), 0x100, "it is not waiting for Startup");
+    ok(&mut resumed, &startup(true));
+    // Past the update counter, which the Startup moves on.
+    assert_eq!(ok(&mut resumed, &pcr_read(8))[14..], pcr[14..]);
+}
+
+/// `Clock` and `Time` go on from where the snapshot left them, whatever the resuming
+/// platform's clock reads.
+#[test]
+fn a_resumed_tpm_keeps_its_clock_and_time() {
+    let (mut tpm, now) = clocked_started(5_000);
+    now.set(5_250);
+    let (time, clock, resets, restarts, safe) = read_clock(&mut tpm);
+    let snapshot = tpm.snapshot();
+    let later = std::rc::Rc::new(std::cell::Cell::new(10u64));
+    let mut resumed = Janus::resume(Clocked(later.clone()), &snapshot).expect("it resumes");
+    later.set(110);
+    assert_eq!(read_clock(&mut resumed), (time + 100, clock + 100, resets, restarts, safe));
+}
+
+/// A snapshot and a state file are never taken for each other, and a damaged snapshot is
+/// refused.
+#[test]
+fn a_snapshot_is_not_a_state_file() {
+    let tpm = started();
+    let snapshot = tpm.snapshot();
+    let state = tpm.state();
+    assert_eq!(Janus::restore(Zero, &snapshot).err(), Some(janus::StateError::NotState));
+    assert_eq!(Janus::resume(Zero, &state).err(), Some(janus::StateError::NotState));
+    let cut = &snapshot[..snapshot.len() - 1];
+    assert_eq!(Janus::resume(Zero, cut).err(), Some(janus::StateError::Damaged));
+}

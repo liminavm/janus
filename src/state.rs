@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The state file's frame: what the TPM keeps in NV, as bytes the device stores and hands back.
+//! A snapshot of the whole TPM ([`crate::Janus::snapshot`]) has the same frame under its own
+//! magic, so neither is ever taken for the other.
 //!
 //! The frame is a magic, a version, the body, and a SHA-256 digest of everything before it. The
 //! digest catches a truncated or damaged file; it is not a MAC, and the file is no more secret
@@ -13,6 +15,10 @@ use zeroize::Zeroizing;
 const MAGIC: [u8; 8] = *b"janusTPM";
 /// The body's format. A change to it is a new version, and an older one stays readable.
 pub const VERSION: u16 = 1;
+/// The first bytes of every snapshot, and its body's format. A snapshot lives as long as one
+/// suspend, but a build that cannot read one still has to say so rather than misread it.
+const SNAPSHOT_MAGIC: [u8; 8] = *b"janusSNP";
+const SNAPSHOT_VERSION: u16 = 1;
 const HEADER: usize = MAGIC.len() + 2;
 const DIGEST: usize = 32;
 
@@ -48,18 +54,36 @@ impl std::error::Error for StateError {}
 
 /// `body` in a frame.
 pub fn frame(body: &[u8]) -> Zeroizing<Vec<u8>> {
+    frame_as(MAGIC, VERSION, body)
+}
+
+/// The body `bytes` frames.
+pub fn unframe(bytes: &[u8]) -> Result<&[u8], StateError> {
+    unframe_as(MAGIC, VERSION, bytes)
+}
+
+/// `body` in a snapshot's frame.
+pub fn frame_snapshot(body: &[u8]) -> Zeroizing<Vec<u8>> {
+    frame_as(SNAPSHOT_MAGIC, SNAPSHOT_VERSION, body)
+}
+
+/// The body a snapshot's frame holds.
+pub fn unframe_snapshot(bytes: &[u8]) -> Result<&[u8], StateError> {
+    unframe_as(SNAPSHOT_MAGIC, SNAPSHOT_VERSION, bytes)
+}
+
+fn frame_as(magic: [u8; 8], version: u16, body: &[u8]) -> Zeroizing<Vec<u8>> {
     let mut out = Zeroizing::new(Vec::with_capacity(HEADER + body.len() + DIGEST));
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION.to_be_bytes());
+    out.extend_from_slice(&magic);
+    out.extend_from_slice(&version.to_be_bytes());
     out.extend_from_slice(body);
     let digest = sha2::Sha256::digest(&out[..]);
     out.extend_from_slice(&digest);
     out
 }
 
-/// The body `bytes` frames.
-pub fn unframe(bytes: &[u8]) -> Result<&[u8], StateError> {
-    if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != MAGIC {
+fn unframe_as(magic: [u8; 8], version: u16, bytes: &[u8]) -> Result<&[u8], StateError> {
+    if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != magic {
         return Err(StateError::NotState);
     }
     if bytes.len() < HEADER + DIGEST {
@@ -69,9 +93,9 @@ pub fn unframe(bytes: &[u8]) -> Result<&[u8], StateError> {
     if sha2::Sha256::digest(framed)[..] != digest[..] {
         return Err(StateError::Damaged);
     }
-    let version = u16::from_be_bytes([framed[MAGIC.len()], framed[MAGIC.len() + 1]]);
-    if version != VERSION {
-        return Err(StateError::Version(version));
+    let found = u16::from_be_bytes([framed[MAGIC.len()], framed[MAGIC.len() + 1]]);
+    if found != version {
+        return Err(StateError::Version(found));
     }
     Ok(&framed[HEADER..])
 }

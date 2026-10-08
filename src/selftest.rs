@@ -353,6 +353,19 @@ fn check(family: Family, v: &Vectors<'_>, platform: &mut impl Platform) -> bool 
 mod tests {
     use super::*;
 
+    /// A snapshot's self-test state reads back as written, and only names families that exist.
+    #[test]
+    fn a_saved_self_test_state_names_only_real_families() {
+        let mut w = Writer::new();
+        ToTest { untested: Family::Aes.bit(), failed: Some(Family::Rsa) }.write(&mut w);
+        let bytes = w.into_vec();
+        let back = ToTest::read(&mut Reader::new(&bytes)).unwrap();
+        assert_eq!((back.untested, back.failed), (Family::Aes.bit(), Some(Family::Rsa)));
+        for bad in [[0x01, 0], [0x80, 0], [0, 5]] {
+            assert!(ToTest::read(&mut Reader::new(&bad)).is_err(), "{bad:?}");
+        }
+    }
+
     struct Zero;
 
     impl Platform for Zero {

@@ -12,12 +12,16 @@ Entries match by substring of their name; with none, every entry runs. Every edi
 string replacement that must match once, and all targets are checked before anything builds, so
 a refactor that moves a target fails loudly instead of quietly testing nothing.
 
-A witness is a `cargo test` filter, or `kani:<harness>` for one Kani proof. A witness that runs
-past `WITNESS_TIMEOUT` is killed with everything it started and reported as `TIMEOUT`: a
-sabotage that makes something loop forever must not take the sweep, or the host, with it.
+A witness is a `cargo test` filter, or `kani:<harness>` for one Kani proof, named as `cargo kani
+list` names it (`module::proofs::name`). A witness that runs past `WITNESS_TIMEOUT` is killed
+with everything it started and reported as `TIMEOUT`: a sabotage that makes something loop
+forever must not take the sweep, or the host, with it. A witness that runs nothing, a filter
+that matches no test or a harness name Kani does not know, is `NO-WITNESS`, never `RED`: both
+exit non-zero without checking anything.
 """
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -35,14 +39,14 @@ SABOTAGES = [
         'src/command.rs',
         'if size as usize != bytes.len() || size > MAX_COMMAND_SIZE {',
         'if size as usize > bytes.len() || size > MAX_COMMAND_SIZE {',
-        'kani:a_frame_has_exactly_the_size_its_header_claims',
+        'kani:command::proofs::a_frame_has_exactly_the_size_its_header_claims',
     ),
     (
         'a TPM2B may be one byte longer than its bound',
         'src/wire.rs',
         '        if n > MAX {',
         '        if n > MAX + 1 {',
-        'kani:tpm2b_reads_exactly_what_it_claims',
+        'kani:wire::proofs::tpm2b_reads_exactly_what_it_claims',
     ),
     (
         'a second Startup is dispatched to the running TPM',
@@ -77,7 +81,7 @@ SABOTAGES = [
         'src/handle.rs',
         '        if h == rh::NULL {\n            return Some(PcrOrNull::Null);',
         '        if h == rh::NULL + 1 {\n            return Some(PcrOrNull::Null);',
-        'kani:pcr_or_null_accepts_exactly_the_pcrs_and_null',
+        'kani:handle::proofs::pcr_or_null_accepts_exactly_the_pcrs_and_null',
     ),
     (
         'a leftover password session is accepted',
@@ -119,7 +123,7 @@ SABOTAGES = [
         'src/context.rs',
         'let in_range = (h & 0x00FF_FFFF) < MAX_ACTIVE_SESSIONS as u32;',
         'let in_range = true;',
-        'kani:saved_handles_are_exactly_tpmi_dh_saved',
+        'kani:context::proofs::saved_handles_are_exactly_tpmi_dh_saved',
     ),
     (
         'a session context loads over a loaded session',
@@ -315,7 +319,7 @@ SABOTAGES = [
         "src/types.rs",
         "if r.u16()? != ST_HASHCHECK {",
         "if r.u16()? == 0 {",
-        "kani:a_hash_check_ticket_reads_only_its_tag_and_a_hierarchy",
+        "kani:types::proofs::a_hash_check_ticket_reads_only_its_tag_and_a_hierarchy",
     ),
     (
         "a sequence tickets data whose first block starts like an attestation",
@@ -329,7 +333,7 @@ SABOTAGES = [
         "src/sequence.rs",
         "if pending.get().len() as u64 != len % 64 {",
         "if false && pending.get().len() as u64 != len % 64 {",
-        "kani:a_hash_state_reads_only_a_state_a_hash_could_reach",
+        "kani:sequence::proofs::a_hash_state_reads_only_a_state_a_hash_could_reach",
     ),
     (
         "a sequence's wrong password counts toward lockout",
@@ -462,7 +466,7 @@ SABOTAGES = [
         "src/nv.rs",
         "    if len > data_size - offset {",
         "    if len > data_size.saturating_sub(offset) + 1 {",
-        "kani:an_nv_range_is_inside_the_index_or_refused",
+        "kani:nv::proofs::an_nv_range_is_inside_the_index_or_refused",
     ),
     (
         "an NV public area may name any handle",
@@ -730,6 +734,48 @@ SABOTAGES = [
         '        if false {',
         'a_refused_startup_leaves_the_orderly_state_for_the_next',
     ),
+    (
+        'a frame shorter than a header and a digest is split',
+        'src/state.rs',
+        '    if bytes.len() < HEADER + DIGEST {',
+        '    if bytes.len() < MAGIC.len() {',
+        'kani:state::proofs::a_frame_splits_only_into_its_parts',
+    ),
+    (
+        'persistent objects load in any order',
+        'src/object.rs',
+        '            if objects.last_key_value().is_some_and(|(last, _)| *last >= h) {',
+        '            if objects.contains_key(&h) {',
+        'persistent_objects_load_back_only_in_order',
+    ),
+    (
+        'a snapshot holds more loaded sessions than the TPM does',
+        'src/session.rs',
+        '        if table.loaded() > MAX_LOADED_SESSIONS {',
+        '        if false {',
+        'a_snapshot_no_tpm_could_have_taken_is_refused',
+    ),
+    (
+        'a stopped TPM resumes holding a loaded session',
+        'src/tpm.rs',
+        '            if reset.sessions.has_loaded() {',
+        '            if false {',
+        'a_snapshot_no_tpm_could_have_taken_is_refused',
+    ),
+    (
+        'a Shutdown(STATE) resumes with nothing to resume',
+        'src/tpm.rs',
+        '        0 if shut_with_state => Err(Fmt1::Value),',
+        '        0 if false => Err(Fmt1::Value),',
+        'a_snapshot_no_tpm_could_have_taken_is_refused',
+    ),
+    (
+        'a snapshot names self-tests that do not exist',
+        'src/selftest.rs',
+        '        if untested & !ToTest::ALL.untested != 0 {',
+        '        if false {',
+        'a_saved_self_test_state_names_only_real_families',
+    ),
 ]
 
 
@@ -739,17 +785,29 @@ def witness(w):
     return ['cargo', 'test', '--quiet', w]
 
 
+def ran_something(w, out):
+    """Whether the witness checked anything: a proof Kani verified (or failed to), or at
+    least one test the filter selected."""
+    if w.startswith('kani:'):
+        return 'VERIFICATION:-' in out
+    counts = re.findall(r'test result: \w+\. (\d+) passed; (\d+) failed', out)
+    # A build that fails runs no test at all: that is the sabotage caught at compile time.
+    return 'could not compile' in out or any(int(p) + int(f) > 0 for p, f in counts)
+
+
 def run(argv):
-    """The witness's exit code, or None when it ran past `WITNESS_TIMEOUT`. It runs in a
-    session of its own, so a timeout kills the test binary cargo started, not only cargo."""
-    p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+    """The witness's exit code and output, or None for the code when it ran past
+    `WITNESS_TIMEOUT`. It runs in a session of its own, so a timeout kills the test binary
+    cargo started, not only cargo."""
+    p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         start_new_session=True, text=True)
     try:
-        return p.wait(timeout=WITNESS_TIMEOUT)
+        out, _ = p.communicate(timeout=WITNESS_TIMEOUT)
+        return p.returncode, out
     except subprocess.TimeoutExpired:
         os.killpg(p.pid, signal.SIGKILL)
-        p.wait()
-        return None
+        out, _ = p.communicate()
+        return None, out
 
 
 def main(patterns):
@@ -767,15 +825,20 @@ def main(patterns):
         clean = f.read_text()
         f.write_text(clean.replace(old, new))
         try:
-            code = run(witness(w))
+            code, out = run(witness(w))
         finally:
             f.write_text(clean)
-        verdict = 'TIMEOUT' if code is None else 'RED' if code != 0 else 'SURVIVED'
+        if code is None:
+            verdict = 'TIMEOUT'
+        elif not ran_something(w, out):
+            verdict = 'NO-WITNESS'
+        else:
+            verdict = 'RED' if code != 0 else 'SURVIVED'
         print(f'{verdict:9} {name}  [{w}]', flush=True)
         if verdict != 'RED':
             unproven.append(name)
     if unproven:
-        sys.exit(f'{len(unproven)} sabotage(s) survived or timed out')
+        sys.exit(f'{len(unproven)} sabotage(s) survived, timed out or had no witness')
 
 
 if __name__ == '__main__':

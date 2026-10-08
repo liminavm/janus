@@ -83,13 +83,7 @@ fn frame_as(magic: [u8; 8], version: u16, body: &[u8]) -> Zeroizing<Vec<u8>> {
 }
 
 fn unframe_as(magic: [u8; 8], version: u16, bytes: &[u8]) -> Result<&[u8], StateError> {
-    if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != magic {
-        return Err(StateError::NotState);
-    }
-    if bytes.len() < HEADER + DIGEST {
-        return Err(StateError::Damaged);
-    }
-    let (framed, digest) = bytes.split_at(bytes.len() - DIGEST);
+    let (framed, digest) = split(magic, bytes)?;
     if sha2::Sha256::digest(framed)[..] != digest[..] {
         return Err(StateError::Damaged);
     }
@@ -98,6 +92,18 @@ fn unframe_as(magic: [u8; 8], version: u16, bytes: &[u8]) -> Result<&[u8], State
         return Err(StateError::Version(found));
     }
     Ok(&framed[HEADER..])
+}
+
+/// A frame with `magic`, as what its digest covers and the digest: no shorter than a header and
+/// a digest, so the version and the body can be read from the first part.
+fn split(magic: [u8; 8], bytes: &[u8]) -> Result<(&[u8], &[u8]), StateError> {
+    if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != magic {
+        return Err(StateError::NotState);
+    }
+    if bytes.len() < HEADER + DIGEST {
+        return Err(StateError::Damaged);
+    }
+    Ok(bytes.split_at(bytes.len() - DIGEST))
 }
 
 #[cfg(test)]
@@ -162,5 +168,27 @@ mod tests {
         let mut tag = body.to_vec();
         *tag.last_mut().unwrap() = 3;
         assert_eq!(restore(&tag), Some(StateError::Invalid));
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// For every buffer of up to 44 bytes, a header and a digest and two more: a frame splits
+    /// only when it starts with the magic and holds at least a header and a digest, and then
+    /// into exactly the bytes the digest covers and the digest.
+    #[kani::proof]
+    #[kani::unwind(45)]
+    fn a_frame_splits_only_into_its_parts() {
+        let data: [u8; HEADER + DIGEST + 2] = kani::any();
+        let len: usize = kani::any_where(|l| *l <= HEADER + DIGEST + 2);
+        let bytes = &data[..len];
+        if let Ok((framed, digest)) = split(MAGIC, bytes) {
+            assert!(len >= HEADER + DIGEST);
+            assert!(bytes[..MAGIC.len()] == MAGIC);
+            assert!(framed.len() == len - DIGEST && digest.len() == DIGEST);
+            assert!(framed.len() >= HEADER);
+        }
     }
 }

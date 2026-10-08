@@ -938,6 +938,29 @@ mod tests {
         assert_eq!(read_prefix::<Object>(&bad).err(), Some(Fmt1::Type));
     }
 
+    /// Persistent objects come back in the order they were saved, and only in ascending handle
+    /// order: anything else would read back to different bytes, or hold a handle twice.
+    #[test]
+    fn persistent_objects_load_back_only_in_order() {
+        let object =
+            || create_primary(&[1; 32], Hierarchy::Null, kernel_template(), empty_sensitive());
+        let mut evicted = Evicted::default();
+        evicted.insert(0x8100_0001, object().unwrap());
+        evicted.insert(0x8100_0002, object().unwrap());
+        let mut w = Writer::new();
+        evicted.write(&mut w);
+        let saved = w.into_vec();
+        let back = Evicted::read(&mut Reader::new(&saved)).unwrap();
+        let mut again = Writer::new();
+        back.write(&mut again);
+        assert_eq!(again.into_vec(), saved);
+        let (first, second) = saved[4..].split_at((saved.len() - 4) / 2);
+        for entries in [[second, first], [first, first]] {
+            let swapped = [&saved[..4], entries[0], entries[1]].concat();
+            assert!(Evicted::read(&mut Reader::new(&swapped)).is_err());
+        }
+    }
+
     #[test]
     fn template_checks_follow_the_reference() {
         let mut t = kernel_template();

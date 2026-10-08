@@ -1249,6 +1249,20 @@ impl SessionTable {
         Ok(table)
     }
 
+    /// A copy of the first loaded session in the first free slot, past what the TPM allows.
+    #[cfg(test)]
+    pub fn overfill(&mut self) {
+        let loaded = self.slots.iter().find_map(|s| match s {
+            SessionSlot::Loaded(s) => Some(s),
+            _ => None,
+        });
+        let mut w = Writer::new();
+        loaded.expect("a loaded session").write(&mut w);
+        let copy = Session::read(&mut Reader::new(&w.into_vec())).unwrap();
+        let free = self.slots.iter().position(|s| matches!(s, SessionSlot::Free)).unwrap();
+        self.slots[free] = SessionSlot::Loaded(Box::new(copy));
+    }
+
     /// Whether any session is loaded: none is in a table a Restart or Resume carries.
     pub fn has_loaded(&self) -> bool {
         self.loaded() > 0

@@ -261,9 +261,11 @@ fn write_carried(w: &mut Writer, carried: Option<&Carried>) {
 }
 
 /// What a stopped TPM carries for a Restart or Resume: never a loaded session, which
-/// `_TPM_Init` drops.
-fn read_carried(r: &mut Reader<'_>) -> Result<Option<Box<Carried>>, Fmt1> {
+/// `_TPM_Init` drops, and always something after a Shutdown(STATE), which saves what a Resume
+/// needs (`Janus::state` relies on it).
+fn read_carried(r: &mut Reader<'_>, shut_with_state: bool) -> Result<Option<Box<Carried>>, Fmt1> {
     match r.u8()? {
+        0 if shut_with_state => Err(Fmt1::Value),
         0 => Ok(None),
         1 => {
             let platform_auth = AuthValue::read(r)?;
@@ -316,11 +318,7 @@ fn read_lifecycle(r: &mut Reader<'_>, now: u64) -> Result<Lifecycle, Fmt1> {
     let clocks = Clocks { last: now, time };
     Ok(match stage {
         0 => {
-            let carried = read_carried(r)?;
-            // A Shutdown(STATE) saves what a Resume needs; `Janus::state` relies on it.
-            if shut_with_state && carried.is_none() {
-                return Err(Fmt1::Value);
-            }
+            let carried = read_carried(r, shut_with_state)?;
             let stage = Initialized { carried };
             Lifecycle::Initialized(Box::new(Tpm { persistent, clocks, lockout, to_test, stage }))
         }
@@ -334,10 +332,7 @@ fn read_lifecycle(r: &mut Reader<'_>, now: u64) -> Result<Lifecycle, Fmt1> {
         }
         2 => {
             let failed = Family::from_location(r.u8()?).ok_or(Fmt1::Value)?;
-            let carried = read_carried(r)?;
-            if shut_with_state && carried.is_none() {
-                return Err(Fmt1::Value);
-            }
+            let carried = read_carried(r, shut_with_state)?;
             let stage = Failure { failed, carried };
             Lifecycle::Failure(Box::new(Tpm { persistent, clocks, lockout, to_test, stage }))
         }
@@ -2550,4 +2545,84 @@ fn read_digest_values(r: &mut Reader<'_>) -> Result<Vec<Digest>, Fmt1> {
         return Err(Fmt1::Size);
     }
     (0..count).map(|_| Digest::read_tagged(r)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Zero;
+
+    impl Platform for Zero {
+        fn fill_random(&mut self, buf: &mut [u8]) {
+            buf.fill(0);
+        }
+        fn now_ms(&mut self) -> u64 {
+            0
+        }
+    }
+
+    fn ok(tpm: &mut Janus<Zero>, c: &[u8]) {
+        let r = tpm.execute(Locality::ZERO, c);
+        assert_eq!(&r[6..10], &[0; 4], "{c:02x?}");
+    }
+
+    const STARTUP: [u8; 12] = [0x80, 0x01, 0, 0, 0, 12, 0, 0, 0x01, 0x44, 0, 0];
+    const SHUTDOWN_STATE: [u8; 12] = [0x80, 0x01, 0, 0, 0, 12, 0, 0, 0x01, 0x45, 0, 1];
+
+    /// TPM2_StartAuthSession: unsalted, unbound, an HMAC session over SHA-256.
+    fn start_session() -> Vec<u8> {
+        let mut c = vec![0x80, 0x01, 0, 0, 0, 0, 0, 0, 0x01, 0x76];
+        c.extend_from_slice(&0x4000_0007u32.to_be_bytes());
+        c.extend_from_slice(&0x4000_0007u32.to_be_bytes());
+        c.extend_from_slice(&[0, 16]);
+        c.extend_from_slice(&[0x33; 16]);
+        c.extend_from_slice(&[0, 0, 0, 0x00, 0x10, 0x00, 0x0B]);
+        let n = c.len() as u32;
+        c[2..6].copy_from_slice(&n.to_be_bytes());
+        c
+    }
+
+    fn started() -> Janus<Zero> {
+        let mut tpm = Janus::manufacture(Zero);
+        tpm.init();
+        ok(&mut tpm, &STARTUP);
+        tpm
+    }
+
+    fn resumes(tpm: &Janus<Zero>) -> bool {
+        Janus::resume(Zero, &tpm.snapshot()).is_ok()
+    }
+
+    /// A snapshot of a state no TPM can be in does not resume: more loaded sessions than the
+    /// TPM holds, a stopped TPM still holding one, or a Shutdown(STATE) with nothing to resume.
+    #[test]
+    fn a_snapshot_no_tpm_could_have_taken_is_refused() {
+        let mut tpm = started();
+        for _ in 0..session::MAX_LOADED_SESSIONS {
+            ok(&mut tpm, &start_session());
+        }
+        assert!(resumes(&tpm));
+        let Some(Lifecycle::Running(t)) = &mut tpm.lifecycle else { unreachable!() };
+        t.stage.reset.sessions.overfill();
+        assert!(!resumes(&tpm), "more loaded sessions than the TPM holds");
+
+        let mut tpm = started();
+        ok(&mut tpm, &start_session());
+        let Some(Lifecycle::Running(t)) = tpm.lifecycle.take() else { unreachable!() };
+        let Tpm { persistent, clocks, lockout, to_test, stage } = *t;
+        let Running { platform_auth, reset, .. } = stage;
+        let carried = Some(Box::new(Carried { platform_auth, reset }));
+        let stopped = Tpm { persistent, clocks, lockout, to_test, stage: Initialized { carried } };
+        tpm.lifecycle = Some(Lifecycle::Initialized(Box::new(stopped)));
+        assert!(!resumes(&tpm), "a stopped TPM holding a loaded session");
+
+        let mut tpm = started();
+        ok(&mut tpm, &SHUTDOWN_STATE);
+        tpm.init();
+        assert!(resumes(&tpm));
+        let Some(Lifecycle::Initialized(t)) = &mut tpm.lifecycle else { unreachable!() };
+        t.stage.carried = None;
+        assert!(!resumes(&tpm), "a Shutdown(STATE) with nothing to resume");
+    }
 }

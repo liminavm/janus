@@ -62,9 +62,10 @@ Each property is held by the cheapest checker that can hold it, and every checke
   over every input of a bounded size: the wire reader, framing, handle classification, response
   code assembly.
 - `cargo +nightly fuzz run <target>` in `fuzz/` (its own workspace) — `execute` (one command into
-  a started TPM), `sequence` (commands, resets and locality changes) and `prepared` (the same,
-  into a TPM already holding a key, a session and saved contexts). Every response must be a
-  well-formed frame. Seed the corpora from the guest captures first:
+  a started TPM), `sequence` (commands, resets and locality changes), `prepared` (the same,
+  into a TPM already holding a key, a session and saved contexts) and `state` (a state file's
+  body, which must be refused or restore to a TPM that saves it back byte for byte). Every
+  response must be a well-formed frame. Seed the corpora from the guest captures first:
   `cargo run --manifest-path fuzz/Cargo.toml --bin seed-corpora`.
 - Miri — `RUSTFLAGS='--cfg sha2_backend="soft"' cargo +nightly miri test --lib` and
   `--test commands` (about 1.5 h together; cap them). The unsafe code is all in dependencies,

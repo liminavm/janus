@@ -6,25 +6,28 @@ limina's virtual TPM.
 
 ## Status
 
-Implemented: `TPM2_Startup`, `TPM2_Shutdown`, `TPM2_SelfTest`, `TPM2_GetCapability`,
-`TPM2_GetRandom`, `TPM2_PCR_Read`, `TPM2_PCR_Extend` and `TPM2_HierarchyChangeAuth`, with
-password sessions and one SHA-256 PCR bank. That covers an edk2 measured boot: the firmware part of
-a captured Fedora boot replays byte for byte against swtpm's answers, up to the kernel's first
-`TPM2_CreatePrimary`.
+The 42 commands its consumers use: lifecycle (`Startup`, `Shutdown`, `SelfTest`,
+`GetTestResult`), capabilities, randomness and the clock; PCRs (`PCR_Read`, `PCR_Extend`);
+primary, ordinary and sealed objects (`CreatePrimary`, `Create`, `Load`, `ReadPublic`, `Unseal`,
+`EvictControl`); signing and decryption (`Sign`, `RSA_Decrypt`, `ECC_Parameters`, `TestParms`);
+hashing and hash sequences; HMAC and policy sessions (`StartAuthSession` with salting, binding and
+AES-128-CFB parameter encryption; `PolicyPCR`, `PolicyAuthValue`, `PolicyPassword`,
+`PolicyCommandCode`, `PolicyGetDigest`, `PolicyRestart`); context save, load and flush; NV indexes
+(define, undefine, read, write, extend, read public); dictionary-attack protection. That is every
+command a stock Fedora guest's systemd (credentials, cryptenroll, PCR policies), clevis,
+ssh-tpm-agent, tpm2-pkcs11, the tpm2 OpenSSL provider, the kernel and edk2's measured boot send.
 
-Next: HMAC and policy sessions (`TPM2_StartAuthSession` with an ECC salt and AES-128-CFB
-parameter encryption), `TPM2_CreatePrimary` for P-256, and context save, load and flush, which
-the kernel's resource manager needs before anything else.
+The device that owns a TPM keeps it with [`Janus::state`] (what NV holds, for a file across power
+cycles) or [`Janus::snapshot`] (everything, volatile state included, for a suspended machine).
 
 ## Known gaps
 
-- **Lockout recovery.** A failed lockout authorization locks lockout authorization until the TPM
-  is manufactured again; `lockoutRecovery` needs a clock, which janus does not have yet.
-- **Context sizes.** `TPM_PT_MAX_OBJECT_CONTEXT` and `TPM_PT_MAX_SESSION_CONTEXT` report the bounds
-  the context format is planned to fit; they must be recomputed when that format exists.
-- **Orderly shutdown.** `TPM2_Shutdown(STATE)` saves the PCRs a resume restores. Clock, the reset
-  and restart counts, and the other state an orderly shutdown governs arrive with the features
-  that own them.
+- **Algorithms.** SHA-256, HMAC, AES-128-CFB, RSA-2048 and ECC P-256, one SHA-256 PCR bank.
+  `TestParms` refuses the rest, so a client asking explicitly for a larger key fails.
+- **Commands.** No `Import`, `PolicyAuthorize`, `PolicySigned` or `PolicySecret`; an
+  unimplemented command answers `TPM_RC_COMMAND_CODE`.
+- **Identity.** No endorsement-key certificate: nothing vouches that this TPM is a TPM.
+- **Capacity.** Three loaded objects, three loaded sessions, seven persistent objects.
 
 ## Licence
 

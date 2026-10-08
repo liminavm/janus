@@ -376,6 +376,43 @@ impl NvStore {
     }
 }
 
+// In the state file: the number of indexes, then each one's public area, authorization value
+// and data. An index's data is always `dataSize` bytes. (Not `Marshal`: `write` is NV_Write.)
+impl NvStore {
+    pub fn save(&self, w: &mut Writer) {
+        w.u32(self.indexes.len() as u32);
+        for index in self.indexes.values() {
+            index.public.write(w);
+            index.auth.write(w);
+            w.bytes(&index.data);
+        }
+    }
+
+    /// No more indexes than the TPM holds, each of a type janus implements, in ascending order
+    /// as `save` writes them, so each is defined once and a state reads back to the same bytes.
+    pub fn load(r: &mut Reader<'_>) -> Result<Self, Fmt1> {
+        let n = r.u32()? as usize;
+        if n > MAX_NV_INDEXES {
+            return Err(Fmt1::Size);
+        }
+        let mut indexes = BTreeMap::new();
+        for _ in 0..n {
+            let public = NvPublic::read(r)?;
+            if public.attributes.kind().is_none() {
+                return Err(Fmt1::Attributes);
+            }
+            let auth = AuthValue::read(r)?;
+            let data = Zeroizing::new(r.bytes(usize::from(public.data_size))?.to_vec());
+            let index = public.index;
+            if indexes.last_key_value().is_some_and(|(last, _)| *last >= index) {
+                return Err(Fmt1::Value);
+            }
+            indexes.insert(index, NvIndex { public, auth, data });
+        }
+        Ok(NvStore { indexes })
+    }
+}
+
 #[cfg(kani)]
 mod proofs {
     use super::*;
@@ -409,5 +446,46 @@ mod proofs {
             assert!(p.attributes.bits() & NvAttributes::RESERVED == 0);
         }
         assert!(round_trips::<NvPublic>(&data[..len]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index(handle: u32) -> NvIndex {
+        let public = NvPublic {
+            index: handle,
+            name_alg: Hash::Sha256,
+            attributes: NvAttributes(0x0006_0006),
+            auth_policy: Digest2b::empty(),
+            data_size: 8,
+        };
+        NvIndex { public, auth: AuthValue::empty(), data: Zeroizing::new(vec![handle as u8; 8]) }
+    }
+
+    /// Indexes come back in the order they were saved, and only in ascending order: anything
+    /// else would read back to different bytes, or define an index twice.
+    #[test]
+    fn a_saved_store_loads_back_only_in_order() {
+        let store = NvStore {
+            indexes: BTreeMap::from([
+                (0x0150_0001, index(0x0150_0001)),
+                (0x0150_0002, index(0x0150_0002)),
+            ]),
+        };
+        let mut w = Writer::new();
+        store.save(&mut w);
+        let saved = w.into_vec();
+        let back = NvStore::load(&mut Reader::new(&saved)).unwrap();
+        let mut again = Writer::new();
+        back.save(&mut again);
+        assert_eq!(again.into_vec(), saved);
+        // Each index is 24 bytes: its public area, an empty authValue, 8 bytes of data.
+        let (first, second) = saved[4..].split_at(24);
+        for entries in [[second, first], [first, first]] {
+            let swapped = [&saved[..4], entries[0], entries[1]].concat();
+            assert!(NvStore::load(&mut Reader::new(&swapped)).is_err());
+        }
     }
 }

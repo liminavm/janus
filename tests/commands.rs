@@ -587,7 +587,8 @@ fn the_clock_runs_while_the_tpm_does_and_time_since_init() {
     // A new TPM is manufactured orderly (`TPM_Manufacture`): its first clock is safe.
     assert_eq!(read_clock(&mut tpm), (250, 250, 1, 0, 1));
 
-    // An orderly Shutdown(STATE) and a Resume: time restarts, the clock goes on, one restart.
+    // An orderly Shutdown(STATE) and a Resume: time restarts, one restart, and the clock goes on
+    // from where Shutdown saved it; the TPM was off in between (`_TPM_Init` reads `go`).
     let power = |tpm: &mut Janus<Clocked>, state: bool, at: u64| {
         assert_eq!(rc(&tpm.execute(Locality::ZERO, &shutdown(state))), 0);
         now.set(at);
@@ -596,29 +597,37 @@ fn the_clock_runs_while_the_tpm_does_and_time_since_init() {
     };
     power(&mut tpm, true, 9_000);
     now.set(9_040);
-    assert_eq!(read_clock(&mut tpm), (40, 4_040, 1, 1, 1));
+    assert_eq!(read_clock(&mut tpm), (40, 290, 1, 1, 1));
     // A platform clock reading earlier than the last counts as no time, nor does the way back.
     now.set(8_000);
-    assert_eq!(read_clock(&mut tpm), (40, 4_040, 1, 1, 1));
+    assert_eq!(read_clock(&mut tpm), (40, 290, 1, 1, 1));
     now.set(9_040);
-    assert_eq!(read_clock(&mut tpm), (40, 4_040, 1, 1, 1));
+    assert_eq!(read_clock(&mut tpm), (40, 290, 1, 1, 1));
     // A Restart counts as a restart too.
     assert_eq!(rc(&tpm.execute(Locality::ZERO, &shutdown(true))), 0);
     tpm.init();
     assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup(false))), 0);
-    assert_eq!(read_clock(&mut tpm), (0, 4_040, 1, 2, 1));
+    assert_eq!(read_clock(&mut tpm), (0, 290, 1, 2, 1));
     // A Reset after an orderly Shutdown(CLEAR) zeroes restartCount and counts a reset.
     power(&mut tpm, false, 9_040);
-    assert_eq!(read_clock(&mut tpm), (0, 4_040, 2, 0, 1));
+    assert_eq!(read_clock(&mut tpm), (0, 290, 2, 0, 1));
     // A Startup with no orderly shutdown before it makes the clock unsafe.
     tpm.init();
     assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup(false))), 0);
-    assert_eq!(read_clock(&mut tpm), (0, 4_040, 3, 0, 0));
+    assert_eq!(read_clock(&mut tpm), (0, 290, 3, 0, 0));
     // It becomes safe again when it crosses a save boundary (2^22 ms), and stays so.
     now.set(9_040 + (1 << 22));
     assert_eq!(read_clock(&mut tpm).4, 1);
     power(&mut tpm, false, 9_040 + (1 << 22));
     assert_eq!(read_clock(&mut tpm).4, 1);
+    // Without a Shutdown, the time since the last save is lost (`TimeClockUpdate` writes `go`
+    // only at a boundary).
+    let saved = read_clock(&mut tpm).1;
+    now.set(9_040 + (1 << 22) + 700);
+    assert_eq!(read_clock(&mut tpm).1, saved + 700);
+    tpm.init();
+    assert_eq!(rc(&tpm.execute(Locality::ZERO, &startup(false))), 0);
+    assert_eq!(read_clock(&mut tpm).1, saved);
 }
 
 /// `TPM_CAP_ALGS` lists every algorithm a client may name in a command janus implements, with
@@ -978,4 +987,156 @@ fn self_test_tests_what_is_left_or_everything_again() {
     // A full test starts over, with hashing.
     assert_eq!(tpm.execute(Locality::ZERO, &self_test(true)), FAILURE);
     assert_eq!(tpm.execute(Locality::ZERO, &get_test_result()), failed_at(1));
+}
+
+fn nv_write_with(index: u32, pw: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut body = index.to_be_bytes().to_vec();
+    body.extend_from_slice(&index.to_be_bytes());
+    body.extend(area(&[password(pw)]));
+    body.extend(tpm2b(data));
+    body.extend_from_slice(&0u16.to_be_bytes());
+    cmd(SESSIONS, 0x137, &body)
+}
+
+fn evict(object: u32, persistent: u32) -> Vec<u8> {
+    let mut body = OWNER.to_be_bytes().to_vec();
+    body.extend_from_slice(&object.to_be_bytes());
+    body.extend(area(&[password(b"")]));
+    body.extend_from_slice(&persistent.to_be_bytes());
+    cmd(SESSIONS, 0x120, &body)
+}
+
+fn restored<P: Platform>(platform: P, state: &[u8]) -> Janus<P> {
+    match Janus::restore(platform, state) {
+        Ok(tpm) => tpm,
+        Err(e) => panic!("the state did not restore: {e}"),
+    }
+}
+
+/// What NV holds comes back from the state: the hierarchy authorizations, an NV index and its
+/// data, a persistent key, the dictionary-attack counter, and after Shutdown(STATE) what a
+/// Resume needs.
+#[test]
+fn a_restored_tpm_holds_what_the_saved_one_held_in_nv() {
+    let mut tpm = started();
+    let index = 0x0150_0000;
+    ok(&mut tpm, &nv_define_pin(index, b"pin", false));
+    ok(&mut tpm, &nv_write_with(index, b"pin", b"sealed!!"));
+    let primary = ok(&mut tpm, &create_primary(OWNER, &PARENT));
+    let primary = u32::from_be_bytes(primary[10..14].try_into().unwrap());
+    ok(&mut tpm, &evict(primary, 0x8100_0001));
+    let public = ok(&mut tpm, &cmd(NO_SESSIONS, 0x173, &0x8100_0001u32.to_be_bytes()));
+    assert_eq!(run(&mut tpm, &nv_read_with(index, index, b"wrong")), 0x98E);
+    ok(&mut tpm, &change_auth(OWNER, b"", b"owner"));
+    ok(&mut tpm, &shutdown(true));
+
+    let saved = tpm.state();
+    let mut back = restored(Zero, &saved);
+    assert_eq!(back.state(), saved, "a restored TPM saves what it restored");
+    ok(&mut back, &startup(true));
+    let read = ok(&mut back, &nv_read_with(index, index, b"pin"));
+    assert_eq!(&read[read.len() - 13..read.len() - 5], b"sealed!!");
+    assert_eq!(ok(&mut back, &cmd(NO_SESSIONS, 0x173, &0x8100_0001u32.to_be_bytes())), public);
+    assert_eq!(da_state(&mut back).0[0], 1);
+    assert_eq!(run(&mut back, &change_auth(OWNER, b"", b"x")), 0x9A2);
+    ok(&mut back, &change_auth(OWNER, b"owner", b""));
+}
+
+/// A state saved with no Shutdown after the last Startup restores as a power loss: the next
+/// Startup is a Reset, the clock is back at its last save and unsafe, and the lost shutdown
+/// counts a dictionary-attack failure.
+#[test]
+fn a_state_saved_without_a_shutdown_restores_as_a_power_loss() {
+    let (mut tpm, now) = clocked_started(1_000);
+    now.set(1_500);
+    assert_eq!(read_clock(&mut tpm), (500, 500, 1, 0, 1));
+    let saved = tpm.state();
+
+    let mut back = restored(Clocked(now.clone()), &saved);
+    assert_eq!(exec(&mut back, &startup(true)), 0x1C4);
+    assert_eq!(exec(&mut back, &startup(false)), 0);
+    assert_eq!(read_clock(&mut back), (0, 0, 2, 0, 0));
+    assert_eq!(da_state(&mut back).0[0], 1);
+}
+
+/// The state changes when NV would be written and not otherwise, so a device that writes it
+/// whenever it differs writes only then.
+#[test]
+fn the_state_changes_only_when_nv_would_be_written() {
+    let (mut tpm, now) = clocked_started(0);
+    let before = tpm.state();
+    let primary = ok_on(&mut tpm, &create_primary(NULL, &PARENT));
+    let primary = u32::from_be_bytes(primary[10..14].try_into().unwrap());
+    for c in [
+        extend(16),
+        cmd(NO_SESSIONS, 0x17B, &8u16.to_be_bytes()),
+        cmd(NO_SESSIONS, 0x17A, &get_capability(6, 0x100, 8)),
+        cmd(NO_SESSIONS, 0x162, &primary.to_be_bytes()),
+    ] {
+        assert_eq!(exec(&mut tpm, &c), 0, "{c:02x?}");
+    }
+    assert_eq!(tpm.state(), before);
+    // Time within a save interval is not saved; crossing a save boundary is.
+    now.set((1 << 22) - 1);
+    assert_eq!(read_clock(&mut tpm).1, (1 << 22) - 1);
+    assert_eq!(tpm.state(), before);
+    now.set(1 << 22);
+    read_clock(&mut tpm);
+    let crossed = tpm.state();
+    assert_ne!(crossed, before);
+    // Defining an index is an NV write; so is a Shutdown.
+    assert_eq!(exec(&mut tpm, &nv_define_pin(0x0150_0000, b"pin", false)), 0);
+    let defined = tpm.state();
+    assert_ne!(defined, crossed);
+    assert_eq!(exec(&mut tpm, &shutdown(false)), 0);
+    assert_ne!(tpm.state(), defined);
+}
+
+fn ok_on<P: Platform>(tpm: &mut Janus<P>, c: &[u8]) -> Vec<u8> {
+    let r = tpm.execute(Locality::ZERO, c);
+    assert_eq!(rc(&r), 0, "{c:02x?}");
+    r
+}
+
+/// A state that is not one, or not whole, is refused; nothing is made in its place.
+#[test]
+fn a_damaged_state_is_refused() {
+    let saved = started().state();
+    let refused = |b: &[u8]| Janus::restore(Zero, b).err();
+    assert_eq!(refused(b""), Some(janus::StateError::NotState));
+    assert_eq!(refused(&saved[..saved.len() - 1]), Some(janus::StateError::Damaged));
+    let mut flipped = saved.to_vec();
+    flipped[100] ^= 0x40;
+    assert_eq!(refused(&flipped), Some(janus::StateError::Damaged));
+    assert!(refused(&saved).is_none());
+}
+
+/// A refused Startup(STATE) changes nothing: the orderly Shutdown(CLEAR) before it still makes
+/// the next Startup(CLEAR) orderly, so the clock stays safe and no failure is counted
+/// (`TPM2_Startup` returns TPM_RC_VALUE before it writes `orderlyState`).
+#[test]
+fn a_refused_startup_leaves_the_orderly_state_for_the_next() {
+    let (mut tpm, _) = clocked_started(0);
+    assert_eq!(exec(&mut tpm, &shutdown(false)), 0);
+    tpm.init();
+    assert_eq!(exec(&mut tpm, &startup(true)), 0x1C4);
+    assert_eq!(exec(&mut tpm, &startup(false)), 0);
+    assert_eq!(read_clock(&mut tpm).4, 1);
+    assert_eq!(da_state(&mut tpm).0[0], 0);
+}
+
+/// A state may hold a reset count at its limit; the next Reset wraps it, as the reference's
+/// counter does, rather than overflowing (found by the `state` fuzzer).
+#[test]
+fn a_reset_count_at_its_limit_wraps() {
+    use sha2::Digest as _;
+    let saved = started().state();
+    // The body: six 32-byte secrets, three empty authorizations, then the reset count.
+    let at = 10 + 6 * 32 + 3 * 2;
+    let mut body = saved[..saved.len() - 32].to_vec();
+    body[at..at + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+    let digest = sha2::Sha256::digest(&body);
+    body.extend_from_slice(&digest);
+    let mut tpm = restored(Zero, &body);
+    ok(&mut tpm, &startup(false));
 }

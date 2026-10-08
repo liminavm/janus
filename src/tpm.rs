@@ -42,6 +42,7 @@ use crate::session::{
     self, AuthValue, Authorization, Authorized, Da, Entity, EntityAuth, Lockout, Session,
     SessionTable, SessionType,
 };
+use crate::state::{self, StateError};
 use crate::types::{
     CreationData, Data2b, Digest2b, EccPoint, EccScheme, HashCheckTicket, KeyedHashScheme, Name2b,
     PublicKind, RsaDecryptScheme, RsaScheme, ST_HASHCHECK, SensitiveCreate, SigScheme, SymDef,
@@ -50,6 +51,7 @@ use crate::types::{
 use crate::wire::{Blame as _, Buf, Reader, Writer};
 use crate::{Locality, Platform};
 use std::cell::Cell;
+use zeroize::Zeroizing;
 
 /// What survives `_TPM_Init`: the state a real TPM keeps in NV.
 struct Persistent {
@@ -68,12 +70,22 @@ struct Persistent {
     /// save; it is set again when `Clock` crosses a save boundary, as the reference sets it when
     /// it writes the clock to NV.
     clock_safe: bool,
+    /// `Clock` and `safe` as NV last held them (`go`): written at manufacture, when `Clock`
+    /// crosses a save boundary, and by `TPM2_Shutdown`. `_TPM_Init` starts the clock again from
+    /// here, so time the TPM ran since the last save is lost unless it shut down in order.
+    saved_clock: SavedClock,
     /// Objects made persistent by `TPM2_EvictControl`.
     evicted: Evicted,
     /// NV indexes.
     nv: NvStore,
     /// The last `TPM2_Shutdown`, until a Startup takes it or a command makes it stale.
     orderly: Option<Orderly>,
+}
+
+#[derive(Clone, Copy)]
+struct SavedClock {
+    clock: u64,
+    safe: bool,
 }
 
 /// What `TPM2_Shutdown` left for the next Startup.
@@ -173,6 +185,7 @@ impl<S> Tpm<S> {
         self.persistent.clock = before.saturating_add(elapsed);
         if self.persistent.clock / CLOCK_SAVE_INTERVAL > before / CLOCK_SAVE_INTERVAL {
             self.persistent.clock_safe = true;
+            self.persistent.saved_clock = SavedClock { clock: self.persistent.clock, safe: true };
         }
     }
 }
@@ -205,6 +218,7 @@ impl<P: Platform> Janus<P> {
             reset_count: 0,
             clock: 0,
             clock_safe: true,
+            saved_clock: SavedClock { clock: 0, safe: true },
             evicted: Evicted::default(),
             nv: NvStore::default(),
             // A new TPM's first Startup must be a Startup(CLEAR), and it finds the state
@@ -236,10 +250,129 @@ impl<P: Platform> Janus<P> {
                 Box::new(Tpm { persistent, clocks, lockout, to_test, stage })
             }
         };
-        next.tick(now);
-        next.clocks.init_at = now;
+        // The clock starts again from NV (`_TPM_Init` reads `go`).
+        let saved = next.persistent.saved_clock;
+        next.persistent.clock = saved.clock;
+        next.persistent.clock_safe = saved.safe;
+        next.clocks = Clocks { last: now, init_at: now };
         next.to_test = ToTest::ALL;
         self.lifecycle = Some(Lifecycle::Initialized(next));
+    }
+
+    /// What the TPM holds in NV: the state a power loss now would leave, for the device to store
+    /// and hand to [`Janus::restore`]. It changes only when NV would be written: a command that
+    /// changes persistent state, a Startup or Shutdown, a dictionary-attack failure, or `Clock`
+    /// crossing a save boundary, so a caller can write it whenever it differs from the last.
+    ///
+    /// What a Restart or Resume needs is in it only after `TPM2_Shutdown(STATE)`, as the
+    /// reference saves it only then.
+    pub fn state(&self) -> Zeroizing<Vec<u8>> {
+        let (persistent, lockout, carried) =
+            match self.lifecycle.as_ref().expect("the TPM is between stages") {
+                Lifecycle::Initialized(t) => (
+                    &t.persistent,
+                    &t.lockout,
+                    t.stage.carried.as_deref().map(|c| (&c.platform_auth, &c.reset)),
+                ),
+                Lifecycle::Running(t) => {
+                    (&t.persistent, &t.lockout, Some((&t.stage.platform_auth, &t.stage.reset)))
+                }
+                Lifecycle::Failure(t) => (
+                    &t.persistent,
+                    &t.lockout,
+                    t.stage.carried.as_deref().map(|c| (&c.platform_auth, &c.reset)),
+                ),
+            };
+        let mut w = Writer::new();
+        persistent.secrets.write(&mut w);
+        persistent.owner_auth.write(&mut w);
+        persistent.endorsement_auth.write(&mut w);
+        persistent.lockout_auth.write(&mut w);
+        w.u64(persistent.reset_count);
+        w.u64(persistent.saved_clock.clock);
+        persistent.saved_clock.safe.write(&mut w);
+        persistent.evicted.write(&mut w);
+        persistent.nv.save(&mut w);
+        lockout.write(&mut w);
+        match &persistent.orderly {
+            None => w.u8(0),
+            Some(Orderly::Clear) => w.u8(1),
+            Some(Orderly::State(pcrs)) => {
+                let (platform_auth, reset) =
+                    carried.expect("a TPM that shut down with STATE carries its reset state");
+                w.u8(2);
+                pcrs.save(&mut w);
+                platform_auth.write(&mut w);
+                reset.null.write(&mut w);
+                reset.sessions.write(&mut w);
+                w.u32(reset.clear_count);
+                w.u32(reset.restart_count);
+                w.u64(reset.object_sequence);
+            }
+        }
+        state::frame(&Zeroizing::new(w.into_vec()))
+    }
+
+    /// The TPM [`Janus::state`] saved, as after `_TPM_Init`: waiting for `TPM2_Startup`.
+    pub fn restore(mut platform: P, state: &[u8]) -> Result<Self, StateError> {
+        let body = state::unframe(state)?;
+        let invalid = |_| StateError::Invalid;
+        let mut r = Reader::new(body);
+        let secrets = PersistentSecrets::read(&mut r).map_err(invalid)?;
+        let owner_auth = AuthValue::read(&mut r).map_err(invalid)?;
+        let endorsement_auth = AuthValue::read(&mut r).map_err(invalid)?;
+        let lockout_auth = AuthValue::read(&mut r).map_err(invalid)?;
+        let reset_count = r.u64().map_err(invalid)?;
+        let saved_clock = SavedClock {
+            clock: r.u64().map_err(invalid)?,
+            safe: bool::read(&mut r).map_err(invalid)?,
+        };
+        let evicted = Evicted::read(&mut r).map_err(invalid)?;
+        let nv = NvStore::load(&mut r).map_err(invalid)?;
+        let lockout = Lockout::read(&mut r).map_err(invalid)?;
+        let (orderly, carried) = match r.u8().map_err(invalid)? {
+            0 => (None, None),
+            1 => (Some(Orderly::Clear), None),
+            2 => {
+                let pcrs = Pcrs::load(&mut r).map_err(invalid)?;
+                let platform_auth = AuthValue::read(&mut r).map_err(invalid)?;
+                let reset = ResetState {
+                    null: NullSecrets::read(&mut r).map_err(invalid)?,
+                    sessions: SessionTable::read(&mut r).map_err(invalid)?,
+                    clear_count: r.u32().map_err(invalid)?,
+                    restart_count: r.u32().map_err(invalid)?,
+                    object_sequence: r.u64().map_err(invalid)?,
+                };
+                (
+                    Some(Orderly::State(Box::new(pcrs))),
+                    Some(Box::new(Carried { platform_auth, reset })),
+                )
+            }
+            _ => return Err(StateError::Invalid),
+        };
+        r.finish().map_err(invalid)?;
+        let persistent = Persistent {
+            owner_auth,
+            endorsement_auth,
+            lockout_auth,
+            secrets,
+            reset_count,
+            clock: saved_clock.clock,
+            clock_safe: saved_clock.safe,
+            saved_clock,
+            evicted,
+            nv,
+            orderly,
+        };
+        let now = platform.now_ms();
+        let tpm = Tpm {
+            persistent,
+            clocks: Clocks { last: now, init_at: now },
+            lockout,
+            to_test: ToTest::ALL,
+            stage: Initialized { carried },
+        };
+        Ok(Janus { platform, lifecycle: Some(Lifecycle::Initialized(Box::new(tpm))) })
     }
 
     /// Executes one command and returns its response. Nothing a guest sends can make this
@@ -385,6 +518,13 @@ impl Tpm<Initialized> {
         if locality.get() != 0 && locality.get() != 3 {
             return Err(Box::new((self, Warn::Locality.into())));
         }
+        // Refused before anything is taken, so a refused Startup(STATE) leaves the orderly state
+        // for the next Startup (`TPM2_Startup` returns before it writes `orderlyState`).
+        let resumable = matches!(self.persistent.orderly, Some(Orderly::State(_)))
+            && self.stage.carried.is_some();
+        if kind == StartupType::State && !resumable {
+            return Err(Box::new((self, Rc::Fmt1(Fmt1::Value, Some(At::param(1))))));
+        }
         let orderly = self.persistent.orderly.take();
         let was_orderly = orderly.is_some();
         let carried = self.stage.carried.take();
@@ -394,9 +534,7 @@ impl Tpm<Initialized> {
                 reset.restart_count = reset.restart_count.wrapping_add(1);
                 (Pcrs::resume(&saved, locality), c.platform_auth, reset)
             }
-            (StartupType::State, _, _) => {
-                return Err(Box::new((self, Rc::Fmt1(Fmt1::Value, Some(At::param(1))))));
-            }
+            (StartupType::State, _, _) => unreachable!("a Startup(STATE) with nothing to resume"),
             (StartupType::Clear, Some(Orderly::State(saved)), Some(c)) => {
                 let mut reset = c.reset;
                 reset.clear_count = reset.clear_count.wrapping_add(1);
@@ -405,7 +543,8 @@ impl Tpm<Initialized> {
                 (Pcrs::restart(&saved, locality), AuthValue::empty(), reset)
             }
             (StartupType::Clear, _, _) => {
-                self.persistent.reset_count += 1;
+                // A restored state may hold any count; the reference's counter wraps.
+                self.persistent.reset_count = self.persistent.reset_count.wrapping_add(1);
                 self.persistent.nv.startup(true);
                 (Pcrs::reset(locality), AuthValue::empty(), ResetState::new(platform))
             }
@@ -586,6 +725,8 @@ impl Tpm<Running> {
                     StartupType::State => Orderly::State(Box::new(self.stage.pcrs.clone())),
                     StartupType::Clear => Orderly::Clear,
                 });
+                self.persistent.saved_clock =
+                    SavedClock { clock: self.persistent.clock, safe: self.persistent.clock_safe };
                 (None, Writer::new(), auth)
             }
             Cc::SelfTest => {

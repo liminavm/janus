@@ -20,7 +20,7 @@ use crate::alg::{Hash, MAX_DIGEST};
 use crate::cc::Attributes;
 use crate::crypto;
 use crate::handle::{AuthSessionHandle, handle_type, ht};
-use crate::marshal::Unmarshal;
+use crate::marshal::{Marshal, Unmarshal};
 use crate::rc::{At, Fmt0, Fmt1, Index, Rc, Slot, Warn};
 use crate::types::{AesDef, Name2b, Secret, SymDef};
 use crate::wire::{Blame as _, Buf, Bytes, Reader, Writer};
@@ -1127,6 +1127,87 @@ pub fn start(
             command_code: None,
             pcr_counter: None,
         }),
+    }
+}
+
+// In the state file.
+
+impl Marshal for AuthValue {
+    fn write(&self, w: &mut Writer) {
+        self.0.write(w);
+    }
+}
+
+impl Unmarshal for AuthValue {
+    fn read(r: &mut Reader<'_>) -> Result<Self, Fmt1> {
+        Ok(AuthValue(Buf::read(r)?))
+    }
+}
+
+/// The counter and the parameters, which the reference keeps in NV; the timers start again at
+/// every Startup and are not saved.
+impl Marshal for Lockout {
+    fn write(&self, w: &mut Writer) {
+        w.u32(self.failed_tries);
+        w.u32(self.max_tries);
+        w.u32(self.recovery_time);
+        w.u32(self.lockout_recovery);
+        self.lockout_auth_enabled.write(w);
+    }
+}
+
+impl Unmarshal for Lockout {
+    fn read(r: &mut Reader<'_>) -> Result<Self, Fmt1> {
+        Ok(Lockout {
+            failed_tries: r.u32()?,
+            max_tries: r.u32()?,
+            recovery_time: r.u32()?,
+            lockout_recovery: r.u32()?,
+            lockout_auth_enabled: bool::read(r)?,
+            now: 0,
+            self_heal_timer: 0,
+            lockout_timer: 0,
+        })
+    }
+}
+
+/// What a Restart or Resume needs of the table: the sequence the next saved session gets, and
+/// which slots hold saved sessions. A loaded session does not survive `_TPM_Init`, so it is
+/// written as a free slot.
+impl Marshal for SessionTable {
+    fn write(&self, w: &mut Writer) {
+        w.u64(self.next_sequence);
+        for slot in &self.slots {
+            match slot {
+                SessionSlot::Free | SessionSlot::Loaded(_) => w.u8(0),
+                SessionSlot::Saved { sequence, kind } => {
+                    w.u8(1);
+                    w.u64(*sequence);
+                    w.u8(*kind);
+                }
+            }
+        }
+    }
+}
+
+impl Unmarshal for SessionTable {
+    fn read(r: &mut Reader<'_>) -> Result<Self, Fmt1> {
+        let next_sequence = r.u64()?;
+        let slots = (0..MAX_ACTIVE_SESSIONS)
+            .map(|_| match r.u8()? {
+                0 => Ok(SessionSlot::Free),
+                1 => {
+                    let sequence = r.u64()?;
+                    let kind = r.u8()?;
+                    if kind != ht::HMAC_SESSION && kind != ht::POLICY_SESSION {
+                        return Err(Fmt1::Value);
+                    }
+                    Ok(SessionSlot::Saved { sequence, kind })
+                }
+                _ => Err(Fmt1::Value),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(SessionTable { slots, next_sequence })
     }
 }
 

@@ -12,6 +12,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.13"
 janus = { path = ".." }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 
 # Its own workspace, so `cargo fuzz` builds it with its own flags and the engine's build never
 # sees it.
@@ -42,6 +43,13 @@ bench = false
 [[bin]]
 name = "prepared"
 path = "fuzz_targets/prepared.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state"
+path = "fuzz_targets/state.rs"
 test = false
 doc = false
 bench = false

@@ -817,6 +817,41 @@ impl Objects {
     }
 }
 
+/// In the state file: the number of persistent objects, then each one's handle and object.
+impl Marshal for Evicted {
+    fn write(&self, w: &mut Writer) {
+        w.u32(self.objects.len() as u32);
+        for (h, o) in &self.objects {
+            w.u32(*h);
+            o.write(w);
+        }
+    }
+}
+
+impl Unmarshal for Evicted {
+    /// No more objects than the TPM holds, each at a persistent handle, in ascending order as
+    /// `write` writes them, so each handle is used once and a state reads back to the same
+    /// bytes.
+    fn read(r: &mut Reader<'_>) -> Result<Self, Fmt1> {
+        let n = r.u32()? as usize;
+        if n > MAX_PERSISTENT_OBJECTS {
+            return Err(Fmt1::Size);
+        }
+        let mut objects = std::collections::BTreeMap::new();
+        for _ in 0..n {
+            let h = r.u32()?;
+            if handle_type(h) != ht::PERSISTENT {
+                return Err(Fmt1::Value);
+            }
+            if objects.last_key_value().is_some_and(|(last, _)| *last >= h) {
+                return Err(Fmt1::Value);
+            }
+            objects.insert(h, Box::new(Object::read(r)?));
+        }
+        Ok(Evicted { objects })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

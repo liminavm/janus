@@ -9,6 +9,7 @@
 use crate::Locality;
 use crate::alg::{Digest, HASHES, Hash};
 use crate::handle::handle_type;
+use crate::marshal::Unmarshal;
 use crate::rc::Fmt1;
 use crate::wire::{Reader, Writer};
 
@@ -272,6 +273,26 @@ impl Pcrs {
             }
         }
         (self.counter, selection, out)
+    }
+}
+
+// In the state file, as `TPM2_Shutdown(STATE)` saved it: the counter, then every PCR's digest.
+// (Not `Marshal`: `read` is PCR_Read.)
+impl Pcrs {
+    pub fn save(&self, w: &mut Writer) {
+        w.u32(self.counter);
+        for d in &self.sha256 {
+            w.bytes(d.as_slice());
+        }
+    }
+
+    pub fn load(r: &mut Reader<'_>) -> Result<Self, Fmt1> {
+        let counter = r.u32()?;
+        let mut sha256 = [Digest::zero(Hash::Sha256); PCR_COUNT];
+        for d in &mut sha256 {
+            *d = Digest::Sha256(<[u8; 32]>::read(r)?);
+        }
+        Ok(Pcrs { sha256, counter })
     }
 }
 

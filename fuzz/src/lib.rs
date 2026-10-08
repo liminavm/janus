@@ -153,3 +153,20 @@ pub fn context_load_record(context: &[u8]) -> Vec<u8> {
     r.extend_from_slice(&cmd);
     r
 }
+
+/// A state file around `body`: the magic, format 1, the body and its SHA-256, as janus frames
+/// it, so the `state` target reaches the body's decoder rather than the digest check.
+pub fn state_file(body: &[u8]) -> Vec<u8> {
+    use sha2::Digest as _;
+    let mut v = b"janusTPM".to_vec();
+    v.extend_from_slice(&1u16.to_be_bytes());
+    v.extend_from_slice(body);
+    let digest = sha2::Sha256::digest(&v);
+    v.extend_from_slice(&digest);
+    v
+}
+
+/// The body of a state file: what [`state_file`] wrapped.
+pub fn state_body(file: &[u8]) -> &[u8] {
+    &file[10..file.len() - 32]
+}

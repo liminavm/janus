@@ -29,10 +29,12 @@ pub mod rc;
 mod selftest;
 mod sequence;
 mod session;
+mod state;
 mod tpm;
 mod types;
 mod wire;
 
+pub use state::StateError;
 pub use tpm::Janus;
 
 /// The locality a command arrived at, 0 to 4. Extended localities are not supported.

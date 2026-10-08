@@ -9,7 +9,8 @@
 //! `execute` gets every distinct command. `sequence` gets each capture as one record stream,
 //! with `_TPM_Init` and locality changes where the capture had them. `prepared` gets every
 //! distinct command as a one-record stream, and a ContextLoad of each context the prepared TPM
-//! saved, which the fuzzer could not otherwise forge.
+//! saved, which the fuzzer could not otherwise forge. `state` gets the bodies of a new TPM's
+//! state file and the prepared TPM's, before and after Shutdown(STATE).
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -58,10 +59,19 @@ fn main() {
         record.extend_from_slice(cmd);
         fs::write(prepared.join(format!("{i:05}")), record).unwrap();
     }
-    let (_, _, contexts) = janus_fuzz::prepared();
+    let (mut tpm, _, contexts) = janus_fuzz::prepared();
     for (i, c) in contexts.iter().enumerate() {
         fs::write(prepared.join(format!("context-{i}")), janus_fuzz::context_load_record(c))
             .unwrap();
     }
+    // The prepared TPM's state, running and after Shutdown(STATE), and a new TPM's.
+    let state = root.join("fuzz/corpus/state");
+    fs::create_dir_all(&state).unwrap();
+    let new = janus::Janus::manufacture(janus_fuzz::Fixed::new().0).state();
+    fs::write(state.join("manufactured"), janus_fuzz::state_body(&new)).unwrap();
+    fs::write(state.join("running"), janus_fuzz::state_body(&tpm.state())).unwrap();
+    let shutdown_state = [0x80, 0x01, 0, 0, 0, 0x0C, 0, 0, 0x01, 0x45, 0, 1];
+    tpm.execute(janus::Locality::ZERO, &shutdown_state);
+    fs::write(state.join("shutdown-state"), janus_fuzz::state_body(&tpm.state())).unwrap();
     println!("{} commands, sequences from every capture", commands.len());
 }

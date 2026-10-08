@@ -10,6 +10,9 @@
 
 use crate::Platform;
 use crate::handle::rh;
+use crate::marshal::{Marshal, Unmarshal};
+use crate::rc::Fmt1;
+use crate::wire::{Reader, Writer};
 use zeroize::Zeroizing;
 
 /// A primary seed or a proof value: as long as a SHA-256 digest (`PRIMARY_SEED_SIZE`,
@@ -136,5 +139,58 @@ impl<'a> Secrets<'a> {
             Hierarchy::Endorsement => self.persistent.endorsement_proof.as_bytes(),
             Hierarchy::Null => self.null.proof.as_bytes(),
         }
+    }
+}
+
+// In the state file: each secret as its bytes, in field order.
+
+impl Marshal for HierarchySecret {
+    fn write(&self, w: &mut Writer) {
+        w.bytes(&self.0[..]);
+    }
+}
+
+impl Unmarshal for HierarchySecret {
+    fn read(r: &mut Reader<'_>) -> Result<Self, Fmt1> {
+        let mut s = Zeroizing::new([0u8; SECRET_SIZE]);
+        s.copy_from_slice(r.bytes(SECRET_SIZE)?);
+        Ok(HierarchySecret(s))
+    }
+}
+
+impl Marshal for PersistentSecrets {
+    fn write(&self, w: &mut Writer) {
+        self.platform_seed.write(w);
+        self.storage_seed.write(w);
+        self.endorsement_seed.write(w);
+        self.platform_proof.write(w);
+        self.storage_proof.write(w);
+        self.endorsement_proof.write(w);
+    }
+}
+
+impl Unmarshal for PersistentSecrets {
+    fn read(r: &mut Reader<'_>) -> Result<Self, Fmt1> {
+        Ok(PersistentSecrets {
+            platform_seed: HierarchySecret::read(r)?,
+            storage_seed: HierarchySecret::read(r)?,
+            endorsement_seed: HierarchySecret::read(r)?,
+            platform_proof: HierarchySecret::read(r)?,
+            storage_proof: HierarchySecret::read(r)?,
+            endorsement_proof: HierarchySecret::read(r)?,
+        })
+    }
+}
+
+impl Marshal for NullSecrets {
+    fn write(&self, w: &mut Writer) {
+        self.seed.write(w);
+        self.proof.write(w);
+    }
+}
+
+impl Unmarshal for NullSecrets {
+    fn read(r: &mut Reader<'_>) -> Result<Self, Fmt1> {
+        Ok(NullSecrets { seed: HierarchySecret::read(r)?, proof: HierarchySecret::read(r)? })
     }
 }

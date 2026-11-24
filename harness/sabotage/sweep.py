@@ -776,6 +776,27 @@ SABOTAGES = [
         '        if false {',
         'a_saved_self_test_state_names_only_real_families',
     ),
+    (
+        'an EK certificate larger than an NV index is provisioned',
+        'src/tpm.rs',
+        '.filter(|s| (1..=nv::MAX_NV_INDEX_SIZE).contains(s))',
+        '.filter(|s| (1..=nv::MAX_NV_INDEX_SIZE + 1).contains(s))',
+        'a_certificate_is_provisioned_once_and_within_an_index',
+    ),
+    (
+        'a provisioned EK certificate is left writable',
+        'src/tpm.rs',
+        '        store.lock_written(index);\n',
+        '',
+        'the_guest_cannot_rewrite_or_delete_the_certificate',
+    ),
+    (
+        'the EK certificate index lacks noDA, which systemd requires',
+        'src/ek.rs',
+        '                | 1 << 25 // noDA\n',
+        '',
+        'systemd_finds_the_certificate_and_persists_the_matching_ek',
+    ),
 ]
 
 

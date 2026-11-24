@@ -315,6 +315,13 @@ impl NvStore {
         Ok(a.orderly())
     }
 
+    /// Locks a written index against writes, as `TPM2_NV_WriteLock` does; with
+    /// `TPMA_NV_WRITEDEFINE` the lock outlasts every Startup ([`NvStore::startup`]).
+    pub fn lock_written(&mut self, n: NvRef) {
+        let index = self.indexes.get_mut(&n.0).expect("an NvRef names a defined index");
+        index.public.attributes = index.public.attributes.with(WRITE_LOCKED, true);
+    }
+
     /// `TPM2_NV_Extend`: the index becomes `H(old || data)`, `old` being zeros before the first
     /// extend. Returns whether the index was `TPMA_NV_ORDERLY`.
     pub fn extend(&mut self, by: NvAuth, n: NvRef, data: &[u8]) -> Result<bool, Rc> {

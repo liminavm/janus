@@ -27,6 +27,7 @@ use crate::cc::Cc;
 use crate::command::{self, Command};
 use crate::context::{self, Context, Epoch, SavedHandle};
 use crate::crypto::{self, EccPrivate, EccPublicKey};
+use crate::ek::{EkProfile, ProvisionError};
 use crate::handle::{
     ContextHandle, EntityHandle, HierarchyAuth, ObjectHandle, PcrOrNull, handle_type, ht,
 };
@@ -45,8 +46,8 @@ use crate::session::{
 use crate::state::{self, StateError};
 use crate::types::{
     CreationData, Data2b, Digest2b, EccPoint, EccScheme, HashCheckTicket, KeyedHashScheme, Name2b,
-    PublicKind, RsaDecryptScheme, RsaScheme, ST_HASHCHECK, SensitiveCreate, SigScheme, SymDef,
-    TkCreation,
+    PublicKind, RsaDecryptScheme, RsaScheme, ST_HASHCHECK, Secret, SensitiveCreate, SigScheme,
+    SymDef, TkCreation,
 };
 use crate::wire::{Blame as _, Buf, Reader, Writer};
 use crate::{Locality, Platform};
@@ -559,6 +560,76 @@ impl<P: Platform> Janus<P> {
         let lifecycle = read_lifecycle(&mut r, now).map_err(|_| StateError::Invalid)?;
         r.finish().map_err(|_| StateError::Invalid)?;
         Ok(Janus { platform, lifecycle: Some(lifecycle) })
+    }
+
+    /// The public key of the EK `profile` describes, as an uncompressed SEC1 point: the key
+    /// `TPM2_CreatePrimary` makes in the endorsement hierarchy from the profile's template, the
+    /// same on every call until the endorsement seed changes. This is what a certificate for
+    /// the EK certifies.
+    pub fn endorsement_key(&self, profile: EkProfile) -> Vec<u8> {
+        let template = profile.template();
+        object::validate_template(&template, 0, None).expect("an EK template is valid");
+        let sensitive = SensitiveCreate { user_auth: Secret::empty(), data: Secret::empty() };
+        let seed = self.persistent().secrets.endorsement_seed.as_bytes();
+        let ek = object::create_primary(seed, Hierarchy::Endorsement, template, sensitive)
+            .expect("janus makes every key size its EK profiles name");
+        let PublicKind::Ecc(ecc) = &ek.public.kind else {
+            unreachable!("every EK profile is an ECC key")
+        };
+        let mut point = vec![0x04];
+        for c in [&ecc.unique.x, &ecc.unique.y] {
+            let c = c.as_slice();
+            point.resize(point.len() + 32 - c.len(), 0);
+            point.extend_from_slice(c);
+        }
+        point
+    }
+
+    /// Whether the profile's certificate index is defined.
+    pub fn has_ek_certificate(&self, profile: EkProfile) -> bool {
+        self.persistent().nv.find(profile.certificate_index()).is_some()
+    }
+
+    /// Defines the profile's certificate index and writes `certificate` (DER) into it, as a
+    /// manufacturer does: platform-created, readable by anyone who can read the TPM, and
+    /// locked against writing until the index is undefined. It becomes part of the state.
+    pub fn provision_ek_certificate(
+        &mut self,
+        profile: EkProfile,
+        certificate: &[u8],
+    ) -> Result<(), ProvisionError> {
+        let size = u16::try_from(certificate.len())
+            .ok()
+            .filter(|s| (1..=nv::MAX_NV_INDEX_SIZE).contains(s))
+            .ok_or(ProvisionError::Size)?;
+        let store = &mut self.persistent_mut().nv;
+        store.define(true, &[], profile.certificate_public(size)).map_err(|rc| match rc {
+            Rc::Fmt0(Fmt0::NvDefined) => ProvisionError::Defined,
+            Rc::Fmt0(Fmt0::NvSpace) => ProvisionError::NoSpace,
+            rc => unreachable!("an EK certificate index is a valid definition: {rc:?}"),
+        })?;
+        let index = store.find(profile.certificate_index()).expect("the index was just defined");
+        store
+            .write(NvAuth::Platform, index, certificate, 0)
+            .expect("the platform writes an index it just defined, within its size");
+        store.lock_written(index);
+        Ok(())
+    }
+
+    fn persistent(&self) -> &Persistent {
+        match self.lifecycle.as_ref().expect("the TPM is between stages") {
+            Lifecycle::Initialized(t) => &t.persistent,
+            Lifecycle::Running(t) => &t.persistent,
+            Lifecycle::Failure(t) => &t.persistent,
+        }
+    }
+
+    fn persistent_mut(&mut self) -> &mut Persistent {
+        match self.lifecycle.as_mut().expect("the TPM is between stages") {
+            Lifecycle::Initialized(t) => &mut t.persistent,
+            Lifecycle::Running(t) => &mut t.persistent,
+            Lifecycle::Failure(t) => &mut t.persistent,
+        }
     }
 
     /// Executes one command and returns its response. Nothing a guest sends can make this

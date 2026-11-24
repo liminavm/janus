@@ -20,6 +20,7 @@ mod cc;
 mod command;
 mod context;
 mod crypto;
+mod ek;
 mod handle;
 mod hierarchy;
 mod nv;
@@ -34,6 +35,7 @@ mod tpm;
 mod types;
 mod wire;
 
+pub use ek::{EkProfile, ProvisionError};
 pub use state::StateError;
 pub use tpm::Janus;
 
